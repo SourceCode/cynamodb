@@ -1,0 +1,39 @@
+# Build artifacts
+build/
+CMakeFiles/
+CMakeCache.txt
+*.cmake
+!fuzzing.cmake
+Makefile
+*.a
+*.so
+*.dylib
+*.exe
+*.o
+*.obj
+
+# Data and Persistence
+data/
+*.log
+*.wal
+*.sst
+manifest.json
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+._*
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+
+# Testing and Coverage
+coverage_report/
+*.info
+coverage/
+fuzz_corpus/

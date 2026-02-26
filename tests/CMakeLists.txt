@@ -1,0 +1,3 @@
+add_executable(unit_tests test_main.cpp test_core.cpp test_schema.cpp test_api.cpp test_json.cpp test_engine.cpp test_memory_engine.cpp test_recovery.cpp test_expressions.cpp test_lsm_primitives.cpp test_metrics.cpp test_transactions_http.cpp test_tables_http.cpp test_items_http.cpp test_streams_http.cpp test_http_security_standardization.cpp test_streams_manager.cpp test_backups_manager.cpp test_scheduler.cpp test_compaction.cpp test_read_opt.cpp test_expr_opt.cpp test_auth_opt.cpp test_capacity.cpp test_partiql.cpp test_resilience.cpp)
+target_link_libraries(unit_tests PRIVATE cynamodb_core Catch2::Catch2WithMain)
+add_test(NAME unit_tests COMMAND unit_tests)

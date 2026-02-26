@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  cynamodb:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - cynamodb_data:/app/data
+    environment:
+      - CYNAMODB_DATA_DIR=/app/data
+      - CYNAMODB_PORT=8000
+
+volumes:
+  cynamodb_data:
