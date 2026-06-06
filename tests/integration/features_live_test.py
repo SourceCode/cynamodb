@@ -294,7 +294,7 @@ def test_table_lifecycle(client):
 
 def test_error_shapes(client):
     print("  [errors] 501 vs UnknownOperation, empty key, miss returns {}")
-    status, body = client.call("CreateBackup", {"TableName": "x", "BackupName": "b"})
+    status, body = client.call("DescribeContributorInsights", {"TableName": "x"})
     check_eq(status, 501, "known-unimplemented status")
     check_eq(err_type(body), "NotImplementedException", "known-unimplemented type")
 

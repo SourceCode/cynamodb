@@ -53,11 +53,15 @@ private:
     std::string backups_dir_;
     std::string metadata_path_;
     std::map<std::string, BackupDescription> backups_;
+    std::map<std::string, std::vector<engine::StorageEngine::AttributeMap>> items_;
     uint64_t next_sequence_ = 1;
     std::shared_mutex mutex_;
 
     void load_metadata();
     void save_metadata();
+    std::string snapshot_path(const std::string& arn) const;
+    void write_snapshot(const std::string& arn, const BackupDescription& desc,
+                        const std::vector<engine::StorageEngine::AttributeMap>& items);
     std::string generate_backup_arn(const std::string& table_name, uint64_t timestamp, uint64_t sequence);
 };
 

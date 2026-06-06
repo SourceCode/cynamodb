@@ -2146,12 +2146,178 @@ ApiResult handle_batch_execute_statement(engine::TableManager& tables, engine::S
     return ok("{\"Responses\":" + responses + "}");
 }
 
+// ---- Backups / PITR / global tables -------------------------------------
+
+std::string serialize_backup_details(const backups::BackupDescription& d) {
+    const auto& s = d.backup_summary;
+    return "{\"BackupArn\":\"" + s.backup_arn + "\",\"BackupName\":\"" + s.backup_name +
+           "\",\"BackupStatus\":\"" + s.backup_status + "\",\"BackupType\":\"" + s.backup_type +
+           "\",\"BackupCreationDateTime\":" + std::to_string(s.backup_creation_datetime) +
+           ",\"BackupSizeBytes\":" + std::to_string(s.backup_size_bytes) + "}";
+}
+
+std::string serialize_backup_summary(const backups::BackupSummary& s) {
+    return "{\"BackupArn\":\"" + s.backup_arn + "\",\"BackupName\":\"" + s.backup_name +
+           "\",\"BackupStatus\":\"" + s.backup_status + "\",\"BackupType\":\"" + s.backup_type +
+           "\",\"TableName\":\"" + s.table_name +
+           "\",\"BackupCreationDateTime\":" + std::to_string(s.backup_creation_datetime) +
+           ",\"BackupSizeBytes\":" + std::to_string(s.backup_size_bytes) + "}";
+}
+
+ApiResult handle_create_backup(engine::TableManager& tables, engine::StorageEngine& storage,
+                               backups::BackupManager& backups, simdjson::dom::element doc) {
+    std::string_view tname;
+    std::string_view bname;
+    if (doc["TableName"].get_string().get(tname) != simdjson::SUCCESS ||
+        doc["BackupName"].get_string().get(bname) != simdjson::SUCCESS) {
+        return error(400, "ValidationException", "TableName and BackupName are required");
+    }
+    auto def = tables.describe_table(tname);
+    if (!def) return error(400, "ResourceNotFoundException", "Table not found: " + std::string(tname));
+    auto scan = storage.scan(std::string(tname), std::nullopt, 0);
+    auto desc = backups.create_backup(std::string(tname), std::string(bname), *def, scan.items);
+    if (!desc) return error(500, "InternalServerError", "Failed to create backup");
+    return ok("{\"BackupDetails\":" + serialize_backup_details(*desc) + "}");
+}
+
+ApiResult handle_list_backups(backups::BackupManager& backups, simdjson::dom::element doc) {
+    std::string_view tname;
+    std::string table = (doc["TableName"].get_string().get(tname) == simdjson::SUCCESS) ? std::string(tname) : "";
+    auto summaries = backups.list_backups(table);
+    std::string out = "{\"BackupSummaries\":[";
+    for (size_t i = 0; i < summaries.size(); ++i) {
+        if (i) out += ",";
+        out += serialize_backup_summary(summaries[i]);
+    }
+    out += "]}";
+    return ok(std::move(out));
+}
+
+ApiResult handle_describe_backup(backups::BackupManager& backups, simdjson::dom::element doc) {
+    std::string_view arn;
+    if (doc["BackupArn"].get_string().get(arn) != simdjson::SUCCESS) {
+        return error(400, "ValidationException", "BackupArn is required");
+    }
+    auto desc = backups.describe_backup(std::string(arn));
+    if (!desc) return error(400, "BackupNotFoundException", "Backup not found: " + std::string(arn));
+    return ok("{\"BackupDescription\":{\"BackupDetails\":" + serialize_backup_details(*desc) + "}}");
+}
+
+ApiResult handle_delete_backup(backups::BackupManager& backups, simdjson::dom::element doc) {
+    std::string_view arn;
+    if (doc["BackupArn"].get_string().get(arn) != simdjson::SUCCESS) {
+        return error(400, "ValidationException", "BackupArn is required");
+    }
+    auto desc = backups.describe_backup(std::string(arn));
+    if (!desc) return error(400, "BackupNotFoundException", "Backup not found: " + std::string(arn));
+    backups.delete_backup(std::string(arn));
+    return ok("{\"BackupDescription\":{\"BackupDetails\":" + serialize_backup_details(*desc) + "}}");
+}
+
+// Recreates a table from a snapshot's definition + items.
+ApiResult restore_into(engine::TableManager& tables, engine::StorageEngine& storage,
+                       core::TableDefinition def, const std::string& target,
+                       const std::vector<AttributeMap>& items) {
+    def.table_name = target;
+    auto created = tables.create_table(def);
+    if (!created) {
+        if (created.error() == engine::TableError::TableAlreadyExists) {
+            return error(400, "TableAlreadyExistsException", "Target table already exists: " + target);
+        }
+        return error(500, "InternalServerError", "Failed to restore table");
+    }
+    for (const auto& item : items) {
+        storage.put(target, engine::encode_primary_key(*created, item), item);
+        maintain_indexes(storage, *created, nullptr, &item);
+    }
+    return ok("{\"TableDescription\":" + serialize_table_description(*created) + "}");
+}
+
+ApiResult handle_restore_table_from_backup(engine::TableManager& tables, engine::StorageEngine& storage,
+                                           backups::BackupManager& backups, simdjson::dom::element doc) {
+    std::string_view arn;
+    std::string_view target;
+    if (doc["BackupArn"].get_string().get(arn) != simdjson::SUCCESS ||
+        doc["TargetTableName"].get_string().get(target) != simdjson::SUCCESS) {
+        return error(400, "ValidationException", "BackupArn and TargetTableName are required");
+    }
+    auto snap = backups.restore_backup(std::string(arn));
+    if (!snap) return error(400, "BackupNotFoundException", "Backup not found: " + std::string(arn));
+    return restore_into(tables, storage, snap->description.table_metadata, std::string(target), snap->items);
+}
+
+ApiResult handle_restore_table_to_pit(engine::TableManager& tables, engine::StorageEngine& storage,
+                                      simdjson::dom::element doc) {
+    std::string_view source;
+    std::string_view target;
+    if (doc["SourceTableName"].get_string().get(source) != simdjson::SUCCESS ||
+        doc["TargetTableName"].get_string().get(target) != simdjson::SUCCESS) {
+        return error(400, "ValidationException", "SourceTableName and TargetTableName are required");
+    }
+    auto def = tables.describe_table(source);
+    if (!def) return error(400, "ResourceNotFoundException", "Table not found: " + std::string(source));
+    // This engine keeps no continuous change history, so PITR restores the current
+    // state of the source table into the target.
+    auto scan = storage.scan(std::string(source), std::nullopt, 0);
+    return restore_into(tables, storage, *def, std::string(target), scan.items);
+}
+
+ApiResult handle_continuous_backups(engine::TableManager& tables, simdjson::dom::element doc, bool update) {
+    std::string_view tname;
+    if (doc["TableName"].get_string().get(tname) != simdjson::SUCCESS) {
+        return error(400, "ValidationException", "TableName is required");
+    }
+    auto def = tables.describe_table(tname);
+    if (!def) return error(400, "ResourceNotFoundException", "Table not found: " + std::string(tname));
+    bool enabled = def->point_in_time_recovery.point_in_time_recovery_enabled;
+    if (update) {
+        simdjson::dom::element pit;
+        if (doc["PointInTimeRecoverySpecification"].get(pit) == simdjson::SUCCESS) {
+            bool e = false;
+            if (pit["PointInTimeRecoveryEnabled"].get_bool().get(e) == simdjson::SUCCESS) enabled = e;
+        }
+    }
+    std::string status = enabled ? "ENABLED" : "DISABLED";
+    return ok("{\"ContinuousBackupsDescription\":{\"ContinuousBackupsStatus\":\"ENABLED\","
+              "\"PointInTimeRecoveryDescription\":{\"PointInTimeRecoveryStatus\":\"" + status + "\"}}}");
+}
+
+ApiResult handle_global_table(engine::TableManager& tables, simdjson::dom::element doc, Operation op) {
+    // Single-node engine: a "global table" is the local table with one replica.
+    if (op == Operation::ListGlobalTables) {
+        auto names = tables.list_tables();
+        std::string out = "{\"GlobalTables\":[";
+        for (size_t i = 0; i < names.size(); ++i) {
+            if (i) out += ",";
+            out += "{\"GlobalTableName\":\"" + names[i] +
+                   "\",\"ReplicationGroup\":[{\"RegionName\":\"ddblocal\"}]}";
+        }
+        out += "]}";
+        return ok(std::move(out));
+    }
+    std::string_view name;
+    if (doc["GlobalTableName"].get_string().get(name) != simdjson::SUCCESS) {
+        return error(400, "ValidationException", "GlobalTableName is required");
+    }
+    if (op == Operation::DescribeGlobalTable || op == Operation::UpdateGlobalTable ||
+        op == Operation::CreateGlobalTable) {
+        auto def = tables.describe_table(name);
+        if (!def && op != Operation::CreateGlobalTable) {
+            return error(400, "GlobalTableNotFoundException", "Global table not found: " + std::string(name));
+        }
+        return ok("{\"GlobalTableDescription\":{\"GlobalTableName\":\"" + std::string(name) +
+                  "\",\"GlobalTableStatus\":\"ACTIVE\",\"ReplicationGroup\":[{\"RegionName\":\"ddblocal\"}]}}");
+    }
+    return error(501, "NotImplementedException", "Unsupported global table operation");
+}
+
 }  // namespace
 
 ApiResult handle_operation(engine::TableManager& tables, engine::StorageEngine& storage,
                            Operation op, std::string_view body,
                            engine::capacity::CapacityManager* capacity,
-                           streams::StreamManager* streams) {
+                           streams::StreamManager* streams,
+                           backups::BackupManager* backups) {
     simdjson::dom::parser parser;
     // An empty body is valid for some operations (e.g. ListTables); default to {}.
     std::string_view effective_body = body.empty() ? std::string_view("{}") : body;
@@ -2214,6 +2380,29 @@ ApiResult handle_operation(engine::TableManager& tables, engine::StorageEngine& 
             case Operation::GetRecords:
                 if (streams) return handle_get_records(*streams, doc);
                 break;
+            case Operation::CreateBackup:
+                if (backups) return handle_create_backup(tables, storage, *backups, doc);
+                break;
+            case Operation::ListBackups:
+                if (backups) return handle_list_backups(*backups, doc);
+                break;
+            case Operation::DescribeBackup:
+                if (backups) return handle_describe_backup(*backups, doc);
+                break;
+            case Operation::DeleteBackup:
+                if (backups) return handle_delete_backup(*backups, doc);
+                break;
+            case Operation::RestoreTableFromBackup:
+                if (backups) { result = handle_restore_table_from_backup(tables, storage, *backups, doc); break; }
+                break;
+            case Operation::RestoreTableToPointInTime:
+                result = handle_restore_table_to_pit(tables, storage, doc); break;
+            case Operation::UpdateContinuousBackups:  return handle_continuous_backups(tables, doc, true);
+            case Operation::DescribeContinuousBackups: return handle_continuous_backups(tables, doc, false);
+            case Operation::CreateGlobalTable:
+            case Operation::DescribeGlobalTable:
+            case Operation::UpdateGlobalTable:
+            case Operation::ListGlobalTables:         return handle_global_table(tables, doc, op);
             case Operation::Unknown:
                 return error(400, "UnknownOperationException",
                              "Unknown operation requested of cynamoDB");
@@ -2238,6 +2427,16 @@ ApiResult handle_operation(engine::TableManager& tables, engine::StorageEngine& 
                 } else if (op == Operation::DeleteTable) {
                     if (capacity != nullptr) capacity->unregister_table(std::string(tname));
                     if (streams != nullptr) streams->remove_table(tname);
+                }
+            }
+            // Restore operations create a brand-new table under TargetTableName.
+            std::string_view target;
+            if ((op == Operation::RestoreTableFromBackup || op == Operation::RestoreTableToPointInTime) &&
+                doc["TargetTableName"].get_string().get(target) == simdjson::SUCCESS) {
+                auto def = tables.describe_table(target);
+                if (def) {
+                    if (capacity != nullptr) capacity->register_table(*def);
+                    if (streams != nullptr) streams->sync_table(*def);
                 }
             }
         }
