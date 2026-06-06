@@ -1,15 +1,37 @@
 #include <cynamodb/engine/lsm/wal.hpp>
 #include <cynamodb/utils/crc32.hpp>
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 namespace cynamodb::engine::lsm {
 
-WriteAheadLog::WriteAheadLog(const std::string& path) : path_(path) {
+namespace {
+
+bool fsync_default_enabled() {
+    const char* env = std::getenv("CYNAMODB_WAL_FSYNC");
+    if (env && (std::string_view(env) == "0" || std::string_view(env) == "off")) {
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+WriteAheadLog::WriteAheadLog(const std::string& path)
+    : WriteAheadLog(path, fsync_default_enabled()) {}
+
+WriteAheadLog::WriteAheadLog(const std::string& path, bool fsync_each)
+    : path_(path), fsync_each_(fsync_each) {
     bool exists = std::filesystem::exists(path_);
     file_.open(path_, std::ios::in | std::ios::out | std::ios::binary);
-    
+
     if (!exists) {
         file_.open(path_, std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc);
         write_header();
@@ -19,11 +41,21 @@ WriteAheadLog::WriteAheadLog(const std::string& path) : path_(path) {
             file_.close();
         }
     }
+
+#ifndef _WIN32
+    if (fsync_each_ && file_.is_open()) {
+        // Companion descriptor on the same file, used only to fdatasync.
+        sync_fd_ = ::open(path_.c_str(), O_RDWR);
+    }
+#endif
 }
 
 WriteAheadLog::~WriteAheadLog() {
     sync();
     if (file_.is_open()) file_.close();
+#ifndef _WIN32
+    if (sync_fd_ >= 0) ::close(sync_fd_);
+#endif
 }
 
 bool WriteAheadLog::write_header() {
@@ -67,20 +99,22 @@ bool WriteAheadLog::append(uint64_t seq, const std::string& key, const std::stri
 
     if (!file_.good()) return false;
 
-    unsynced_writes_++;
-    if (unsynced_writes_ >= kAutoSyncEvery) {
-        sync();
-    }
-    return true;
+    // Durably commit every record. sync() flushes file_ to the OS and, when
+    // fsync is enabled, fdatasyncs to the device so an acknowledged write
+    // survives both a process crash (kill -9) and a power/OS crash.
+    return sync();
 }
 
 bool WriteAheadLog::sync() {
-    if (file_.is_open()) {
-        file_.flush();
-        unsynced_writes_ = 0;
-        return true;
+    if (!file_.is_open()) return false;
+    file_.flush();
+    unsynced_writes_ = 0;
+#ifndef _WIN32
+    if (fsync_each_ && sync_fd_ >= 0) {
+        ::fdatasync(sync_fd_);
     }
-    return false;
+#endif
+    return file_.good();
 }
 
 bool WriteAheadLog::reset() {
@@ -88,7 +122,13 @@ bool WriteAheadLog::reset() {
     file_.close();
     std::filesystem::remove(path_);
     file_.open(path_, std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc);
-    return write_header();
+    bool ok = write_header();
+#ifndef _WIN32
+    // The file was recreated (new inode); re-point the fsync descriptor.
+    if (sync_fd_ >= 0) ::close(sync_fd_);
+    sync_fd_ = (fsync_each_ && file_.is_open()) ? ::open(path_.c_str(), O_RDWR) : -1;
+#endif
+    return ok;
 }
 
 std::vector<WriteAheadLog::ReplayRecord> WriteAheadLog::replay() {

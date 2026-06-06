@@ -31,18 +31,45 @@ public:
 private:
     void flush_memtable();
     void background_compaction();
+    // Merges every on-disk SSTable into a single one (newest-wins, tombstones
+    // purged), bounding read amplification and disk usage. Must be called with
+    // mutex_ held exclusively.
+    void compact_locked();
     std::string get_table_path(const std::string& table_name) const;
+    // Merged, tombstone-resolved, sorted snapshot of the table across all levels.
+    // Caller must hold mutex_ (shared is sufficient).
+    std::map<std::string, AttributeMap, core::StringViewLess> materialize() const;
+
+    // --- durability / recovery ---
+    std::string wal_path(uint64_t generation) const;
+    void load_sstables_from_manifest();
+    void recover_from_wal();
+    void append_to_wal(const std::string& internal_key, bool is_delete, const AttributeMap& attributes);
+
+    // An immutable (frozen) memtable awaiting flush, paired with the WAL segment
+    // that durably holds its writes until the SSTable is written.
+    struct ImmutableMemtable {
+        std::shared_ptr<MemTable> table;
+        std::string wal_path;
+    };
 
     std::string db_path_;
     std::shared_ptr<core::Arena> arena_;
     std::unique_ptr<MemTable> memtable_;
-    std::vector<std::shared_ptr<MemTable>> immutable_memtables_;
+    std::vector<ImmutableMemtable> immutable_memtables_;
     std::deque<std::shared_ptr<SSTable>> sstables_;
+    uint64_t wal_generation_ = 0;
+    uint64_t wal_seq_ = 0;
     
     std::shared_mutex mutex_;
     std::condition_variable_any flush_cv_;
     std::condition_variable_any compaction_cv_;
     std::atomic<bool> shutting_down_{false};
+    // Edge-triggered signal for the compaction thread. Set by the flush thread
+    // when an L0 compaction becomes due, cleared once handled, so the compaction
+    // thread runs once per event instead of spinning on a level-triggered
+    // predicate (compaction does not yet reduce the L0 file count).
+    bool compaction_pending_ = false;
     std::thread flush_thread_;
     std::thread compaction_thread_;
 

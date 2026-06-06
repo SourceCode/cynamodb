@@ -71,7 +71,134 @@ std::expected<void, TableError> TableManager::check_collection_limit(const std::
     return {};
 }
 
-void TableManager::load_metadata() {}
-void TableManager::save_metadata() {}
+namespace {
+
+constexpr uint32_t kMetadataMagic = 0x4359544D;  // "CYTM"
+constexpr uint32_t kMetadataVersion = 1;
+
+void write_u32(std::ostream& os, uint32_t v) {
+    os.write(reinterpret_cast<const char*>(&v), sizeof(v));
+}
+void write_u64(std::ostream& os, uint64_t v) {
+    os.write(reinterpret_cast<const char*>(&v), sizeof(v));
+}
+void write_u8(std::ostream& os, uint8_t v) {
+    os.write(reinterpret_cast<const char*>(&v), sizeof(v));
+}
+void write_str(std::ostream& os, const std::string& s) {
+    write_u32(os, static_cast<uint32_t>(s.size()));
+    os.write(s.data(), static_cast<std::streamsize>(s.size()));
+}
+
+bool read_u32(std::istream& is, uint32_t& v) {
+    is.read(reinterpret_cast<char*>(&v), sizeof(v));
+    return static_cast<size_t>(is.gcount()) == sizeof(v);
+}
+bool read_u64(std::istream& is, uint64_t& v) {
+    is.read(reinterpret_cast<char*>(&v), sizeof(v));
+    return static_cast<size_t>(is.gcount()) == sizeof(v);
+}
+bool read_u8(std::istream& is, uint8_t& v) {
+    is.read(reinterpret_cast<char*>(&v), sizeof(v));
+    return static_cast<size_t>(is.gcount()) == sizeof(v);
+}
+bool read_str(std::istream& is, std::string& s) {
+    uint32_t len = 0;
+    if (!read_u32(is, len)) return false;
+    if (len > 64 * 1024) return false;  // sanity bound for a table-metadata string
+    s.resize(len);
+    is.read(s.data(), static_cast<std::streamsize>(len));
+    return static_cast<size_t>(is.gcount()) == len;
+}
+
+}  // namespace
+
+// Persists the table catalog. Only the fields required by the data plane are
+// stored (name, key schema, attribute definitions, billing mode, creation time);
+// secondary-index/stream configuration is not yet round-tripped. The caller must
+// hold the write lock.
+void TableManager::save_metadata() {
+    const std::string tmp_path = metadata_path_ + ".tmp";
+    {
+        std::ofstream os(tmp_path, std::ios::binary | std::ios::trunc);
+        if (!os) return;
+
+        write_u32(os, kMetadataMagic);
+        write_u32(os, kMetadataVersion);
+        write_u32(os, static_cast<uint32_t>(tables_.size()));
+
+        for (const auto& [name, def] : tables_) {
+            write_str(os, name);
+            write_u8(os, static_cast<uint8_t>(def.billing_mode));
+            write_u64(os, def.creation_epoch_seconds);
+
+            write_u32(os, static_cast<uint32_t>(def.key_schema.size()));
+            for (const auto& ks : def.key_schema) {
+                write_str(os, ks.attribute_name);
+                write_u8(os, static_cast<uint8_t>(ks.key_type));
+            }
+
+            write_u32(os, static_cast<uint32_t>(def.attribute_definitions.size()));
+            for (const auto& [attr_name, attr_type] : def.attribute_definitions) {
+                write_str(os, attr_name);
+                write_u8(os, static_cast<uint8_t>(attr_type));
+            }
+        }
+    }
+    // Atomically replace so a crash mid-write never leaves a corrupt catalog.
+    std::error_code ec;
+    std::filesystem::rename(tmp_path, metadata_path_, ec);
+    if (ec) {
+        std::filesystem::remove(tmp_path, ec);
+    }
+}
+
+void TableManager::load_metadata() {
+    if (!std::filesystem::exists(metadata_path_)) return;
+    std::ifstream is(metadata_path_, std::ios::binary);
+    if (!is) return;
+
+    uint32_t magic = 0;
+    uint32_t version = 0;
+    uint32_t table_count = 0;
+    if (!read_u32(is, magic) || !read_u32(is, version) || !read_u32(is, table_count)) return;
+    if (magic != kMetadataMagic || version != kMetadataVersion) {
+        std::cerr << "TableManager: unrecognized metadata file, ignoring: " << metadata_path_ << std::endl;
+        return;
+    }
+
+    std::map<std::string, core::TableDefinition, core::StringViewLess> loaded;
+    for (uint32_t i = 0; i < table_count; ++i) {
+        core::TableDefinition def;
+        uint8_t billing = 0;
+        if (!read_str(is, def.table_name) || !read_u8(is, billing) ||
+            !read_u64(is, def.creation_epoch_seconds)) {
+            return;  // truncated; keep whatever the constructor started with (empty)
+        }
+        def.billing_mode = static_cast<core::BillingMode>(billing);
+
+        uint32_t ks_count = 0;
+        if (!read_u32(is, ks_count)) return;
+        for (uint32_t j = 0; j < ks_count; ++j) {
+            core::KeySchemaElement ks;
+            uint8_t kt = 0;
+            if (!read_str(is, ks.attribute_name) || !read_u8(is, kt)) return;
+            ks.key_type = static_cast<core::KeyType>(kt);
+            def.key_schema.push_back(std::move(ks));
+        }
+
+        uint32_t ad_count = 0;
+        if (!read_u32(is, ad_count)) return;
+        for (uint32_t j = 0; j < ad_count; ++j) {
+            std::string attr_name;
+            uint8_t at = 0;
+            if (!read_str(is, attr_name) || !read_u8(is, at)) return;
+            def.attribute_definitions[attr_name] = static_cast<core::AttributeType>(at);
+        }
+
+        loaded[def.table_name] = std::move(def);
+    }
+    tables_ = std::move(loaded);
+}
 
 } // namespace cynamodb::engine

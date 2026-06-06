@@ -15,6 +15,7 @@
 #include <string_view>
 #include <system_error>
 #include <cynamodb/engine/table_manager.hpp>
+#include <cynamodb/engine/storage_engine.hpp>
 #include <cynamodb/engine/lsm/lsm_engine.hpp>
 #include <cynamodb/streams/manager.hpp>
 #include <cynamodb/backups/manager.hpp>
@@ -35,7 +36,7 @@ struct RequestContext {
 };
 struct Context {
     std::shared_ptr<engine::TableManager> table_manager;
-    std::shared_ptr<engine::lsm::LsmEngine> storage_engine;
+    std::shared_ptr<engine::StorageEngine> storage_engine;
     std::shared_ptr<streams::StreamManager> stream_manager;
     std::shared_ptr<backups::BackupManager> backup_manager;
     std::mutex transaction_mutex;

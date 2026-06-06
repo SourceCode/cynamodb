@@ -35,6 +35,10 @@ private:
     static ThreadLocalData& get_thread_local();
     static std::vector<ThreadLocalData*>& get_all_threads();
     static std::mutex& get_registry_mutex();
+    // Accumulates counters from threads that have exited so their contribution
+    // is not lost (and so the registry never dereferences freed thread_local
+    // storage). Guarded by get_registry_mutex().
+    static uint64_t* get_dead_totals();
 };
 
 class ScopedTimer {

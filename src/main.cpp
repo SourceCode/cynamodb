@@ -1,14 +1,14 @@
 #include <iostream>
 #include <simdjson.h>
 #include <cynamodb/http/server.hpp>
+#include <cynamodb/context.hpp>
 #include <cynamodb/core/memory_resource.hpp>
-#include <cynamodb/core/scheduler.hpp>
 #include <boost/asio/io_context.hpp>
-#include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/signal_set.hpp>
 #include <algorithm>
 #include <charconv>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
@@ -53,17 +53,23 @@ int main() {
             }
         }
 
-        boost::asio::io_context ioc{threads};
-        cynamodb::core::WorkStealingScheduler scheduler(threads);
-        
-        // Start server
+        // Build the execution context (table catalog + storage engine + streams)
+        // and start the HTTP server that speaks the DynamoDB JSON protocol.
+        cynamodb::Context ctx;
+        cynamodb::http::HttpServer server(ctx);
+
         std::cout << "Listening on " << bind_addr << ":" << port << " with " << threads << " threads" << std::endl;
-        
-        // Block until SIGINT or SIGTERM
-        boost::asio::signal_set signals(ioc, SIGINT, SIGTERM);
-        signals.async_wait([&](auto, int) { ioc.stop(); });
-        
-        ioc.run();
+        server.run(bind_addr, static_cast<unsigned short>(port), threads);
+
+        // Block the main thread until SIGINT or SIGTERM, then shut the server down.
+        boost::asio::io_context signal_ioc;
+        boost::asio::signal_set signals(signal_ioc, SIGINT, SIGTERM);
+        signals.async_wait([&](auto, int) {
+            std::cout << "\ncynamoDB shutting down..." << std::endl;
+            server.stop();
+            signal_ioc.stop();
+        });
+        signal_ioc.run();
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
         return 1;

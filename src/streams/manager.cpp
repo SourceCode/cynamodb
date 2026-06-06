@@ -13,7 +13,9 @@ std::string generate_event_id() {
     static thread_local std::mt19937 rng{std::random_device{}()};
     std::uniform_int_distribution<uint64_t> dist;
     char buf[33];
-    snprintf(buf, sizeof(buf), "%016llx%016llx", dist(rng), dist(rng));
+    snprintf(buf, sizeof(buf), "%016llx%016llx",
+             static_cast<unsigned long long>(dist(rng)),
+             static_cast<unsigned long long>(dist(rng)));
     return std::string(buf);
 }
 

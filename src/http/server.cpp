@@ -1,7 +1,10 @@
 #include <cynamodb/http/server.hpp>
+#include <cynamodb/api/dispatcher.hpp>
+#include <cynamodb/api/handlers.hpp>
 #include <boost/asio/dispatch.hpp>
 #include <iostream>
 #include <random>
+#include <string>
 
 namespace cynamodb::http {
 
@@ -89,22 +92,35 @@ void HttpSession::on_read(beast::error_code ec, std::size_t bytes_transferred) {
 
 void HttpSession::handle_request() {
     http::response<http::string_body> res{http::status::ok, req_.version()};
-    res.set(http::field::server, "cynamoDB/0.1.0");
+    res.set(http::field::server, "cynamoDB/2.2.0");
     res.set(http::field::content_type, "application/x-amz-json-1.0");
     
     // Request ID
     static thread_local std::mt19937 rng{std::random_device{}()};
     std::uniform_int_distribution<uint64_t> dist;
     char req_id[17];
-    snprintf(req_id, sizeof(req_id), "%016llx", dist(rng));
+    snprintf(req_id, sizeof(req_id), "%016llx", static_cast<unsigned long long>(dist(rng)));
     res.set("x-amzn-RequestId", req_id);
 
     if (req_.target() == "/health") {
         res.body() = "{\"status\":\"healthy\"}";
     } else {
-        res.body() = "{}";
+        // DynamoDB protocol: POST "/" with the operation in the X-Amz-Target
+        // header and a JSON body. Route to the operation handler.
+        auto target_view = req_["X-Amz-Target"];
+        std::string target(target_view.data(), target_view.size());
+        api::Operation op = api::ApiDispatcher::parse_target(target);
+
+        api::ApiResult result =
+            api::handle_operation(*ctx_.table_manager, *ctx_.storage_engine, op, req_.body());
+
+        res.result(static_cast<http::status>(result.status));
+        if (!result.error_type.empty()) {
+            res.set("x-amzn-ErrorType", result.error_type);
+        }
+        res.body() = std::move(result.body);
     }
-    
+
     res.prepare_payload();
     do_write(std::move(res));
 }

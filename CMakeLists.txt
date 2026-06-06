@@ -1,16 +1,27 @@
 cmake_minimum_required(VERSION 3.25)
-project(cynamoDB VERSION 2.1.2 LANGUAGES CXX)
+project(cynamoDB VERSION 2.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Compiler flags
+# Strict warning flags for OUR code only. Third-party dependencies fetched via
+# FetchContent (Catch2, simdjson) must not be held to -Werror, otherwise a
+# deprecation warning in a newer compiler breaks the whole build.
 if(MSVC)
-    add_compile_options(/W4 /WX /permissive-)
+    set(CYNAMODB_WARNING_FLAGS /W4 /WX /permissive-)
 else()
-    add_compile_options(-Wall -Wextra -Wpedantic -Werror)
+    set(CYNAMODB_WARNING_FLAGS -Wall -Wextra -Wpedantic -Werror)
+    # simdjson's public headers (included by our TUs) use a UDL syntax that newer
+    # compilers flag as deprecated. It is not a bug in our code, so keep it a
+    # warning instead of an error while leaving -Werror on for everything else.
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag(-Wno-error=deprecated-literal-operator
+        CYNAMODB_HAS_NO_ERROR_DEPRECATED_LITERAL_OPERATOR)
+    if(CYNAMODB_HAS_NO_ERROR_DEPRECATED_LITERAL_OPERATOR)
+        list(APPEND CYNAMODB_WARNING_FLAGS -Wno-error=deprecated-literal-operator)
+    endif()
 endif()
 
 if(POLICY CMP0167)
@@ -45,6 +56,7 @@ add_library(cynamodb_core STATIC
     src/http/server.cpp 
     src/auth/sigv4.cpp
     src/api/dispatcher.cpp
+    src/api/handlers.cpp
     src/json/serializer.cpp
     src/json/json_writer.cpp
     src/utils/buffer_pool.cpp
@@ -54,6 +66,7 @@ add_library(cynamodb_core STATIC
     src/engine/table_manager.cpp
     src/engine/capacity/manager.cpp
     src/engine/memory_engine.cpp
+    src/engine/key_codec.cpp
     src/engine/item_validator.cpp
     src/engine/lsm/memtable.cpp
     src/engine/lsm/manifest.cpp
@@ -62,6 +75,7 @@ add_library(cynamodb_core STATIC
     src/engine/lsm/gsi_manager.cpp
     src/engine/lsm/lsi_manager.cpp
     src/engine/lsm/wal.cpp
+    src/engine/lsm/record_codec.cpp
     src/engine/lsm/lsm_engine.cpp
     src/engine/lsm/sstable.cpp
     src/expressions/lexer.cpp
@@ -76,6 +90,7 @@ add_library(cynamodb_core STATIC
 )
 target_include_directories(cynamodb_core PUBLIC include)
 target_link_libraries(cynamodb_core PUBLIC simdjson::simdjson Boost::boost)
+target_compile_options(cynamodb_core PRIVATE ${CYNAMODB_WARNING_FLAGS})
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
     include(CheckIPOSupported)
@@ -87,9 +102,11 @@ endif()
 
 add_executable(cynamodb src/main.cpp)
 target_link_libraries(cynamodb PRIVATE cynamodb_core)
+target_compile_options(cynamodb PRIVATE ${CYNAMODB_WARNING_FLAGS})
 
 add_executable(bench_performance tests/bench_performance.cpp)
 target_link_libraries(bench_performance PRIVATE cynamodb_core)
+target_compile_options(bench_performance PRIVATE ${CYNAMODB_WARNING_FLAGS})
 
 enable_testing()
 add_subdirectory(tests)

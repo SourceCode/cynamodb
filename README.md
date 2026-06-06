@@ -1,4 +1,4 @@
-# cynamoDB v2.1.2
+# cynamoDB v2.2.0
 
 cynamoDB is a high-performance, local DynamoDB-compatible database engine written in C++23. It provides 1:1 API compatibility with Amazon DynamoDB, enabling local development, testing, and edge computing without relying on the AWS cloud.
 
@@ -37,18 +37,62 @@ graph TD
 ## Quick Start
 1. **Build**:
    ```bash
-   mkdir build && cd build
-   cmake .. -DCMAKE_BUILD_TYPE=Release
-   make -j$(nproc)
+   cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+   cmake --build build -j
    ```
-2. **Run**:
+2. **Run** (configured via environment variables):
    ```bash
-   ./cynamodb --port 8000 --data-dir ./data
+   CYNAMODB_DATA_DIR=./data CYNAMODB_PORT=8000 ./build/cynamodb
    ```
-3. **Use with CLI**:
+   Recognized variables: `CYNAMODB_BIND_ADDR` (default `0.0.0.0`), `CYNAMODB_PORT`
+   (default `8000`), `CYNAMODB_THREADS`, `CYNAMODB_DATA_DIR` (default `./data`),
+   `CYNAMODB_WAL_FSYNC` (`0` to disable per-write fsync for throughput).
+3. **Use with the AWS CLI / SDKs**:
    ```bash
-   aws dynamodb list-tables --endpoint-url http://localhost:8000
+   aws dynamodb create-table --endpoint-url http://localhost:8000 \
+     --table-name Users --billing-mode PAY_PER_REQUEST \
+     --attribute-definitions AttributeName=id,AttributeType=S \
+     --key-schema AttributeName=id,KeyType=HASH
+   aws dynamodb put-item --endpoint-url http://localhost:8000 \
+     --table-name Users --item '{"id":{"S":"u1"},"name":{"S":"Alice"}}'
+   aws dynamodb get-item --endpoint-url http://localhost:8000 \
+     --table-name Users --key '{"id":{"S":"u1"}}'
    ```
+
+## Supported operations
+
+The HTTP/JSON data plane is implemented end-to-end for the core operations:
+
+- **Tables**: `CreateTable`, `DescribeTable`, `ListTables`
+- **Items**: `PutItem`, `GetItem`, `DeleteItem`
+- **Bulk reads**: `Scan` (with `Limit` / `ExclusiveStartKey` pagination),
+  `Query` (partition-key equality via legacy `KeyConditions`, results sorted by sort key)
+
+Scalar types (`S`, `N`, `BOOL`, `NULL`) and maps (`M`) round-trip over HTTP and persist.
+See [ITEMS_TO_FIX.md](ITEMS_TO_FIX.md) and [tests/TEST_COVERAGE.md](tests/TEST_COVERAGE.md)
+for the current limitations (e.g. `KeyConditionExpression`, `UpdateItem`, conditional
+writes, transactions over HTTP, GSI/LSI, and SigV4 enforcement are not yet wired).
+
+## Durability & persistence
+
+- **Write-ahead log**: every acknowledged write is `fdatasync`'d to disk, so data
+  survives a process crash (`kill -9`) and a power/OS crash. Set `CYNAMODB_WAL_FSYNC=0`
+  to trade durability for throughput.
+- **LSM storage**: the memtable flushes to immutable SSTables, which are merged by a
+  background compaction that keeps the on-disk file count bounded and purges tombstones.
+- **Recovery**: on startup the engine reloads SSTables from the manifest and replays the
+  WAL; the table catalog is persisted atomically. Tables and items survive restarts.
+
+## Testing
+
+```bash
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug && cmake --build build -j
+ctest --test-dir build --output-on-failure
+```
+
+This runs the Catch2 unit suite plus live integration tests that drive the real server
+binary over HTTP — full CRUD across restarts, crash recovery (`SIGKILL`), and concurrent
+multi-client load. See [tests/TEST_COVERAGE.md](tests/TEST_COVERAGE.md) for details.
 
 See [Installation Guide](docs/install.md) and [First Run](docs/first-run.md) for more details.
 

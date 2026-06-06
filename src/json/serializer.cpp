@@ -81,8 +81,61 @@ core::AttributeValue JsonParser::parse_attribute_value(simdjson::dom::element el
     return val;
 }
 
-core::TableDefinition JsonParser::parse_table_definition([[maybe_unused]] simdjson::dom::element el) {
-    return {};
+namespace {
+
+core::KeyType parse_key_type(std::string_view s) {
+    return s == "RANGE" ? core::KeyType::RANGE : core::KeyType::HASH;
+}
+
+std::optional<core::AttributeType> parse_attribute_type(std::string_view s) {
+    if (s == "S") return core::AttributeType::S;
+    if (s == "N") return core::AttributeType::N;
+    if (s == "B") return core::AttributeType::B;
+    return std::nullopt;
+}
+
+}  // namespace
+
+core::TableDefinition JsonParser::parse_table_definition(simdjson::dom::element el) {
+    core::TableDefinition def;
+
+    std::string_view name;
+    if (el["TableName"].get_string().get(name) == simdjson::SUCCESS) {
+        def.table_name = std::string(name);
+    }
+
+    simdjson::dom::array key_schema;
+    if (el["KeySchema"].get_array().get(key_schema) == simdjson::SUCCESS) {
+        for (auto elem : key_schema) {
+            std::string_view attr_name;
+            std::string_view key_type;
+            if (elem["AttributeName"].get_string().get(attr_name) == simdjson::SUCCESS &&
+                elem["KeyType"].get_string().get(key_type) == simdjson::SUCCESS) {
+                def.key_schema.push_back({std::string(attr_name), parse_key_type(key_type)});
+            }
+        }
+    }
+
+    simdjson::dom::array attr_defs;
+    if (el["AttributeDefinitions"].get_array().get(attr_defs) == simdjson::SUCCESS) {
+        for (auto elem : attr_defs) {
+            std::string_view attr_name;
+            std::string_view attr_type;
+            if (elem["AttributeName"].get_string().get(attr_name) == simdjson::SUCCESS &&
+                elem["AttributeType"].get_string().get(attr_type) == simdjson::SUCCESS) {
+                if (auto t = parse_attribute_type(attr_type)) {
+                    def.attribute_definitions[std::string(attr_name)] = *t;
+                }
+            }
+        }
+    }
+
+    std::string_view billing;
+    if (el["BillingMode"].get_string().get(billing) == simdjson::SUCCESS && billing == "PROVISIONED") {
+        def.billing_mode = core::BillingMode::PROVISIONED;
+    }
+
+    return def;
 }
 
 std::string JsonSerializer::serialize_attribute_value(const core::AttributeValue& val) {
