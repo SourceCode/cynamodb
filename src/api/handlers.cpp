@@ -1789,6 +1789,363 @@ bool is_write_op(Operation op) {
     return op == Operation::PutItem || op == Operation::UpdateItem || op == Operation::DeleteItem;
 }
 
+// ---- PartiQL ------------------------------------------------------------
+// A focused PartiQL implementation for SELECT / INSERT / UPDATE / DELETE that
+// reuses the storage engine plus index/stream maintenance. SELECT scans the table
+// and filters in-handler; write statements address a single item by full key.
+
+struct PqlToken { enum T { Ident, Str, Num, Param, Punct, End } t; std::string s; };
+
+std::vector<PqlToken> pql_tokenize(const std::string& in, bool& bad) {
+    std::vector<PqlToken> out;
+    bad = false;
+    size_t i = 0;
+    while (i < in.size()) {
+        char c = in[i];
+        if (std::isspace(static_cast<unsigned char>(c)) != 0) { ++i; continue; }
+        if (c == '\'') {
+            std::string s;
+            ++i;
+            while (i < in.size() && in[i] != '\'') {
+                if (in[i] == '\'' ) break;
+                s.push_back(in[i++]);
+            }
+            if (i >= in.size()) { bad = true; break; }
+            ++i;  // closing quote
+            out.push_back({PqlToken::Str, s});
+        } else if (c == '"') {  // quoted identifier (table/attr name)
+            std::string s; ++i;
+            while (i < in.size() && in[i] != '"') s.push_back(in[i++]);
+            if (i >= in.size()) { bad = true; break; }
+            ++i;
+            out.push_back({PqlToken::Ident, s});
+        } else if (c == '?') { out.push_back({PqlToken::Param, "?"}); ++i; }
+        else if (std::isalpha(static_cast<unsigned char>(c)) != 0 || c == '_') {
+            std::string s;
+            while (i < in.size() && (std::isalnum(static_cast<unsigned char>(in[i])) != 0 ||
+                                     in[i] == '_' || in[i] == '.')) s.push_back(in[i++]);
+            out.push_back({PqlToken::Ident, s});
+        } else if (std::isdigit(static_cast<unsigned char>(c)) != 0 || c == '-' ) {
+            std::string s;
+            while (i < in.size() && (std::isdigit(static_cast<unsigned char>(in[i])) != 0 ||
+                                     in[i] == '.' || in[i] == '-' || in[i] == '+' ||
+                                     in[i] == 'e' || in[i] == 'E')) s.push_back(in[i++]);
+            out.push_back({PqlToken::Num, s});
+        } else if (c == '<' && i + 1 < in.size() && in[i+1] == '=') { out.push_back({PqlToken::Punct, "<="}); i += 2; }
+        else if (c == '>' && i + 1 < in.size() && in[i+1] == '=') { out.push_back({PqlToken::Punct, ">="}); i += 2; }
+        else if (c == '<' && i + 1 < in.size() && in[i+1] == '>') { out.push_back({PqlToken::Punct, "<>"}); i += 2; }
+        else if (std::string("={}[](),*<>.:").find(c) != std::string::npos) {
+            out.push_back({PqlToken::Punct, std::string(1, c)}); ++i;
+        } else { bad = true; break; }
+    }
+    out.push_back({PqlToken::End, ""});
+    return out;
+}
+
+std::string pql_upper(const std::string& s) {
+    std::string u = s;
+    std::transform(u.begin(), u.end(), u.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    return u;
+}
+
+struct PqlParser {
+    const std::vector<PqlToken>& toks;
+    const std::vector<std::shared_ptr<core::AttributeValue>>& params;
+    size_t pos = 0;
+    size_t next_param = 0;
+    std::string error;
+
+    const PqlToken& peek() const { return toks[pos]; }
+    const PqlToken& advance() { return toks[pos < toks.size() - 1 ? pos++ : pos]; }
+    bool kw(const char* k) {
+        if (peek().t == PqlToken::Ident && pql_upper(peek().s) == k) { advance(); return true; }
+        return false;
+    }
+    bool punct(const char* p) {
+        if (peek().t == PqlToken::Punct && peek().s == p) { advance(); return true; }
+        return false;
+    }
+
+    std::shared_ptr<core::AttributeValue> parse_value() {
+        const PqlToken& t = peek();
+        if (t.t == PqlToken::Param) {
+            advance();
+            if (next_param >= params.size()) { error = "Not enough parameters for PartiQL statement"; return nullptr; }
+            return params[next_param++];
+        }
+        if (t.t == PqlToken::Str) { advance(); auto v = std::make_shared<core::AttributeValue>(); v->type = core::AttributeType::S; v->value = core::String(t.s); return v; }
+        if (t.t == PqlToken::Num) { advance(); auto v = std::make_shared<core::AttributeValue>(); v->type = core::AttributeType::N; v->value = core::String(t.s); return v; }
+        if (t.t == PqlToken::Ident) {
+            std::string u = pql_upper(t.s);
+            if (u == "TRUE" || u == "FALSE") { advance(); auto v = std::make_shared<core::AttributeValue>(); v->type = core::AttributeType::BOOL; v->value = (u == "TRUE"); return v; }
+            if (u == "NULL") { advance(); auto v = std::make_shared<core::AttributeValue>(); v->type = core::AttributeType::NUL; v->value = std::monostate{}; return v; }
+        }
+        if (t.t == PqlToken::Punct && t.s == "{") {
+            advance();
+            auto v = std::make_shared<core::AttributeValue>(); v->type = core::AttributeType::M;
+            core::MapValue m;
+            if (!(peek().t == PqlToken::Punct && peek().s == "}")) {
+                while (true) {
+                    if (peek().t != PqlToken::Str) { error = "Map keys must be quoted strings"; return nullptr; }
+                    std::string key = advance().s;
+                    if (!punct(":")) { error = "Map entry requires ':'"; return nullptr; }
+                    auto val = parse_value();
+                    if (!val) return nullptr;
+                    m[core::String(key)] = val;
+                    if (punct(",")) continue;
+                    break;
+                }
+            }
+            if (!punct("}")) { error = "Unterminated map literal"; return nullptr; }
+            v->value = std::move(m);
+            return v;
+        }
+        if (t.t == PqlToken::Punct && t.s == "[") {
+            advance();
+            auto v = std::make_shared<core::AttributeValue>(); v->type = core::AttributeType::L;
+            core::ListValue l;
+            if (!(peek().t == PqlToken::Punct && peek().s == "]")) {
+                while (true) { auto e = parse_value(); if (!e) return nullptr; l.push_back(e); if (punct(",")) continue; break; }
+            }
+            if (!punct("]")) { error = "Unterminated list literal"; return nullptr; }
+            v->value = std::move(l);
+            return v;
+        }
+        error = "Unexpected token in PartiQL value";
+        return nullptr;
+    }
+};
+
+bool pql_attr_compare(const core::AttributeValue& a, const std::string& op, const core::AttributeValue& b) {
+    if (a.type != b.type) return op == "<>";  // different types: only <> is true
+    auto cmp_lt = [&]() -> bool {
+        if (a.type == core::AttributeType::S) return std::get<core::String>(a.value) < std::get<core::String>(b.value);
+        if (a.type == core::AttributeType::N) return std::strtold(std::get<core::String>(a.value).c_str(), nullptr) <
+                                                     std::strtold(std::get<core::String>(b.value).c_str(), nullptr);
+        return false;
+    };
+    bool eq = false;
+    if (a.type == core::AttributeType::S || a.type == core::AttributeType::N) eq = std::get<core::String>(a.value) == std::get<core::String>(b.value);
+    else if (a.type == core::AttributeType::BOOL) eq = std::get<bool>(a.value) == std::get<bool>(b.value);
+    else if (a.type == core::AttributeType::NUL) eq = true;
+    if (op == "=") return eq;
+    if (op == "<>") return !eq;
+    if (op == "<") return cmp_lt();
+    if (op == ">") return !cmp_lt() && !eq;
+    if (op == "<=") return cmp_lt() || eq;
+    if (op == ">=") return !cmp_lt();
+    return false;
+}
+
+struct PqlCond { std::string attr; std::string op; std::shared_ptr<core::AttributeValue> value; };
+
+ApiResult execute_partiql(engine::TableManager& tables, engine::StorageEngine& storage,
+                          streams::StreamManager* streams, const std::string& statement,
+                          const std::vector<std::shared_ptr<core::AttributeValue>>& params) {
+    bool bad = false;
+    auto toks = pql_tokenize(statement, bad);
+    if (bad) return error(400, "ValidationException", "Invalid PartiQL statement syntax");
+    PqlParser p{toks, params, 0, 0, {}};
+
+    auto parse_where = [&](std::vector<PqlCond>& conds) -> bool {
+        if (!p.kw("WHERE")) return true;  // no WHERE
+        while (true) {
+            if (p.peek().t != PqlToken::Ident) { p.error = "Expected attribute in WHERE"; return false; }
+            PqlCond c;
+            c.attr = p.advance().s;
+            if (p.peek().t != PqlToken::Punct) { p.error = "Expected operator in WHERE"; return false; }
+            c.op = p.advance().s;
+            c.value = p.parse_value();
+            if (!c.value) return false;
+            conds.push_back(std::move(c));
+            if (p.kw("AND")) continue;
+            break;
+        }
+        return true;
+    };
+    auto table_name_token = [&]() -> std::optional<std::string> {
+        if (p.peek().t != PqlToken::Ident) { p.error = "Expected table name"; return std::nullopt; }
+        return p.advance().s;
+    };
+
+    // ---- SELECT ----
+    if (p.kw("SELECT")) {
+        std::vector<std::string> select_list;
+        if (p.punct("*")) { /* all */ }
+        else {
+            while (true) {
+                if (p.peek().t != PqlToken::Ident) { return error(400, "ValidationException", "Invalid SELECT list"); }
+                select_list.push_back(p.advance().s);
+                if (p.punct(",")) continue;
+                break;
+            }
+        }
+        if (!p.kw("FROM")) return error(400, "ValidationException", "PartiQL SELECT requires FROM");
+        auto tname = table_name_token();
+        if (!tname) return error(400, "ValidationException", p.error);
+        auto def = tables.describe_table(*tname);
+        if (!def) return error(400, "ResourceNotFoundException", "Table not found: " + *tname);
+        std::vector<PqlCond> conds;
+        if (!parse_where(conds)) return error(400, "ValidationException", p.error);
+
+        auto scan = storage.scan(*tname, std::nullopt, 0);
+        std::string items = "[";
+        bool first = true;
+        for (const auto& item : scan.items) {
+            if (item_is_expired(*def, item)) continue;
+            bool match = true;
+            for (const auto& c : conds) {
+                auto it = item.find(c.attr);
+                if (it == item.end() || !it->second || !pql_attr_compare(*it->second, c.op, *c.value)) { match = false; break; }
+            }
+            if (!match) continue;
+            AttributeMap projected;
+            if (select_list.empty()) projected = item;
+            else for (const auto& a : select_list) { auto it = item.find(a); if (it != item.end()) projected[a] = it->second; }
+            if (!first) items += ",";
+            items += json::JsonSerializer::serialize_item(projected);
+            first = false;
+        }
+        items += "]";
+        return ok("{\"Items\":" + items + "}");
+    }
+
+    // ---- INSERT ----
+    if (p.kw("INSERT")) {
+        if (!p.kw("INTO")) return error(400, "ValidationException", "PartiQL INSERT requires INTO");
+        auto tname = table_name_token();
+        if (!tname) return error(400, "ValidationException", p.error);
+        auto def = tables.describe_table(*tname);
+        if (!def) return error(400, "ResourceNotFoundException", "Table not found: " + *tname);
+        if (!p.kw("VALUE")) return error(400, "ValidationException", "PartiQL INSERT requires VALUE");
+        auto val = p.parse_value();
+        if (!val || val->type != core::AttributeType::M) return error(400, "ValidationException", p.error.empty() ? "INSERT VALUE must be a map" : p.error);
+        AttributeMap item;
+        for (const auto& [k, v] : std::get<core::MapValue>(val->value)) item[std::string(k)] = v;
+        if (!item_has_all_keys(*def, item)) return error(400, "ValidationException", "INSERT item missing key attributes");
+        std::string key = engine::encode_primary_key(*def, item);
+        auto old = storage.get(*tname, key);
+        storage.put(*tname, key, item);
+        maintain_indexes(storage, *def, old ? &*old : nullptr, &item);
+        emit_stream(streams, *def, old ? "MODIFY" : "INSERT", extract_keys(*def, item), old, item);
+        return ok("{}");
+    }
+
+    // ---- UPDATE ----
+    if (p.kw("UPDATE")) {
+        auto tname = table_name_token();
+        if (!tname) return error(400, "ValidationException", p.error);
+        auto def = tables.describe_table(*tname);
+        if (!def) return error(400, "ResourceNotFoundException", "Table not found: " + *tname);
+        if (!p.kw("SET")) return error(400, "ValidationException", "PartiQL UPDATE requires SET");
+        std::vector<PqlCond> sets;
+        while (true) {
+            if (p.peek().t != PqlToken::Ident) return error(400, "ValidationException", "Invalid SET assignment");
+            PqlCond a; a.attr = p.advance().s;
+            if (!p.punct("=")) return error(400, "ValidationException", "SET assignment requires '='");
+            a.value = p.parse_value();
+            if (!a.value) return error(400, "ValidationException", p.error);
+            sets.push_back(std::move(a));
+            if (p.punct(",")) continue;
+            break;
+        }
+        std::vector<PqlCond> conds;
+        if (!parse_where(conds)) return error(400, "ValidationException", p.error);
+        AttributeMap key_map;
+        for (const auto& c : conds) if (c.op == "=") key_map[c.attr] = c.value;
+        if (!item_has_all_keys(*def, key_map)) return error(400, "ValidationException", "PartiQL UPDATE requires the full primary key in WHERE");
+        std::string key = engine::encode_primary_key(*def, key_map);
+        AttributeMap new_item;
+        auto outcome = storage.mutate(*tname, key, [&](const AttributeMap* cur) {
+            AttributeMap working = cur ? *cur : AttributeMap{};
+            for (const auto& [k, v] : key_map) working[k] = v;
+            for (const auto& s : sets) working[s.attr] = s.value;
+            new_item = working;
+            return engine::StorageEngine::Mutation{engine::StorageEngine::MutationKind::Put, working};
+        });
+        maintain_indexes(storage, *def, outcome.previous ? &*outcome.previous : nullptr, &new_item);
+        emit_stream(streams, *def, outcome.previous ? "MODIFY" : "INSERT", extract_keys(*def, new_item), outcome.previous, new_item);
+        return ok("{}");
+    }
+
+    // ---- DELETE ----
+    if (p.kw("DELETE")) {
+        if (!p.kw("FROM")) return error(400, "ValidationException", "PartiQL DELETE requires FROM");
+        auto tname = table_name_token();
+        if (!tname) return error(400, "ValidationException", p.error);
+        auto def = tables.describe_table(*tname);
+        if (!def) return error(400, "ResourceNotFoundException", "Table not found: " + *tname);
+        std::vector<PqlCond> conds;
+        if (!parse_where(conds)) return error(400, "ValidationException", p.error);
+        AttributeMap key_map;
+        for (const auto& c : conds) if (c.op == "=") key_map[c.attr] = c.value;
+        if (!item_has_all_keys(*def, key_map)) return error(400, "ValidationException", "PartiQL DELETE requires the full primary key in WHERE");
+        std::string key = engine::encode_primary_key(*def, key_map);
+        auto outcome = storage.mutate(*tname, key, [&](const AttributeMap*) {
+            return engine::StorageEngine::Mutation{engine::StorageEngine::MutationKind::Delete, {}};
+        });
+        if (outcome.previous) {
+            maintain_indexes(storage, *def, &*outcome.previous, nullptr);
+            emit_stream(streams, *def, "REMOVE", extract_keys(*def, *outcome.previous), outcome.previous, std::nullopt);
+        }
+        return ok("{}");
+    }
+
+    return error(400, "ValidationException", "Unsupported PartiQL statement");
+}
+
+ApiResult handle_execute_statement(engine::TableManager& tables, engine::StorageEngine& storage,
+                                   streams::StreamManager* streams, simdjson::dom::element doc) {
+    std::string_view stmt;
+    if (doc["Statement"].get_string().get(stmt) != simdjson::SUCCESS) {
+        return error(400, "ValidationException", "Statement is required");
+    }
+    std::vector<std::shared_ptr<core::AttributeValue>> params;
+    simdjson::dom::array arr;
+    if (doc["Parameters"].get_array().get(arr) == simdjson::SUCCESS) {
+        try {
+            for (auto p : arr) params.push_back(std::make_shared<core::AttributeValue>(json::JsonParser::parse_attribute_value(p)));
+        } catch (const std::exception&) {
+            return error(400, "ValidationException", "Invalid Parameters");
+        }
+    }
+    return execute_partiql(tables, storage, streams, std::string(stmt), params);
+}
+
+ApiResult handle_batch_execute_statement(engine::TableManager& tables, engine::StorageEngine& storage,
+                                         streams::StreamManager* streams, simdjson::dom::element doc) {
+    simdjson::dom::array stmts;
+    if (doc["Statements"].get_array().get(stmts) != simdjson::SUCCESS) {
+        return error(400, "ValidationException", "Statements is required");
+    }
+    std::string responses = "[";
+    bool first = true;
+    for (auto s : stmts) {
+        std::string_view stmt;
+        if (s["Statement"].get_string().get(stmt) != simdjson::SUCCESS) {
+            return error(400, "ValidationException", "Each statement requires a Statement");
+        }
+        std::vector<std::shared_ptr<core::AttributeValue>> params;
+        simdjson::dom::array arr;
+        if (s["Parameters"].get_array().get(arr) == simdjson::SUCCESS) {
+            try {
+                for (auto pe : arr) params.push_back(std::make_shared<core::AttributeValue>(json::JsonParser::parse_attribute_value(pe)));
+            } catch (const std::exception&) { return error(400, "ValidationException", "Invalid Parameters"); }
+        }
+        auto r = execute_partiql(tables, storage, streams, std::string(stmt), params);
+        if (!first) responses += ",";
+        if (r.status == 200) {
+            // SELECT returns {"Items":[...]}; surface its Items, else an empty success entry.
+            responses += r.body.rfind("{\"Items\":", 0) == 0 ? r.body : std::string("{}");
+        } else {
+            responses += "{\"Error\":{\"Code\":\"ValidationError\",\"Message\":\"statement failed\"}}";
+        }
+        first = false;
+    }
+    responses += "]";
+    return ok("{\"Responses\":" + responses + "}");
+}
+
 }  // namespace
 
 ApiResult handle_operation(engine::TableManager& tables, engine::StorageEngine& storage,
@@ -1843,6 +2200,8 @@ ApiResult handle_operation(engine::TableManager& tables, engine::StorageEngine& 
             case Operation::BatchGetItem:       return handle_batch_get_item(tables, storage, doc);
             case Operation::TransactWriteItems: return handle_transact_write_items(tables, storage, doc, streams);
             case Operation::TransactGetItems:   return handle_transact_get_items(tables, storage, doc);
+            case Operation::ExecuteStatement:   return handle_execute_statement(tables, storage, streams, doc);
+            case Operation::BatchExecuteStatement: return handle_batch_execute_statement(tables, storage, streams, doc);
             case Operation::ListStreams:
                 if (streams) return handle_list_streams(*streams, doc);
                 break;
