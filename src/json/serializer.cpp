@@ -125,6 +125,45 @@ std::optional<core::AttributeType> parse_attribute_type(std::string_view s) {
 
 }  // namespace
 
+namespace {
+
+std::vector<core::KeySchemaElement> parse_key_schema(simdjson::dom::element el) {
+    std::vector<core::KeySchemaElement> schema;
+    simdjson::dom::array arr;
+    if (el.get_array().get(arr) == simdjson::SUCCESS) {
+        for (auto elem : arr) {
+            std::string_view attr_name;
+            std::string_view key_type;
+            if (elem["AttributeName"].get_string().get(attr_name) == simdjson::SUCCESS &&
+                elem["KeyType"].get_string().get(key_type) == simdjson::SUCCESS) {
+                schema.push_back({std::string(attr_name), parse_key_type(key_type)});
+            }
+        }
+    }
+    return schema;
+}
+
+core::Projection parse_projection(simdjson::dom::element el) {
+    core::Projection proj;
+    proj.projection_type = core::ProjectionType::ALL;
+    std::string_view ptype;
+    if (el["ProjectionType"].get_string().get(ptype) == simdjson::SUCCESS) {
+        if (ptype == "KEYS_ONLY") proj.projection_type = core::ProjectionType::KEYS_ONLY;
+        else if (ptype == "INCLUDE") proj.projection_type = core::ProjectionType::INCLUDE;
+        else proj.projection_type = core::ProjectionType::ALL;
+    }
+    simdjson::dom::array nka;
+    if (el["NonKeyAttributes"].get_array().get(nka) == simdjson::SUCCESS) {
+        for (auto a : nka) {
+            std::string_view v;
+            if (a.get_string().get(v) == simdjson::SUCCESS) proj.non_key_attributes.push_back(std::string(v));
+        }
+    }
+    return proj;
+}
+
+}  // namespace
+
 core::TableDefinition JsonParser::parse_table_definition(simdjson::dom::element el) {
     core::TableDefinition def;
 
@@ -133,15 +172,38 @@ core::TableDefinition JsonParser::parse_table_definition(simdjson::dom::element 
         def.table_name = std::string(name);
     }
 
-    simdjson::dom::array key_schema;
-    if (el["KeySchema"].get_array().get(key_schema) == simdjson::SUCCESS) {
-        for (auto elem : key_schema) {
-            std::string_view attr_name;
-            std::string_view key_type;
-            if (elem["AttributeName"].get_string().get(attr_name) == simdjson::SUCCESS &&
-                elem["KeyType"].get_string().get(key_type) == simdjson::SUCCESS) {
-                def.key_schema.push_back({std::string(attr_name), parse_key_type(key_type)});
-            }
+    simdjson::dom::element ks_el;
+    if (el["KeySchema"].get(ks_el) == simdjson::SUCCESS) {
+        def.key_schema = parse_key_schema(ks_el);
+    }
+
+    simdjson::dom::array gsis;
+    if (el["GlobalSecondaryIndexes"].get_array().get(gsis) == simdjson::SUCCESS) {
+        for (auto g : gsis) {
+            core::GlobalSecondaryIndex gsi;
+            std::string_view iname;
+            if (g["IndexName"].get_string().get(iname) != simdjson::SUCCESS) continue;
+            gsi.index_name = std::string(iname);
+            simdjson::dom::element gks;
+            if (g["KeySchema"].get(gks) == simdjson::SUCCESS) gsi.key_schema = parse_key_schema(gks);
+            simdjson::dom::element gproj;
+            if (g["Projection"].get(gproj) == simdjson::SUCCESS) gsi.projection = parse_projection(gproj);
+            def.global_secondary_indexes.push_back(std::move(gsi));
+        }
+    }
+
+    simdjson::dom::array lsis;
+    if (el["LocalSecondaryIndexes"].get_array().get(lsis) == simdjson::SUCCESS) {
+        for (auto li : lsis) {
+            core::LocalSecondaryIndex lsi;
+            std::string_view iname;
+            if (li["IndexName"].get_string().get(iname) != simdjson::SUCCESS) continue;
+            lsi.index_name = std::string(iname);
+            simdjson::dom::element lks;
+            if (li["KeySchema"].get(lks) == simdjson::SUCCESS) lsi.key_schema = parse_key_schema(lks);
+            simdjson::dom::element lproj;
+            if (li["Projection"].get(lproj) == simdjson::SUCCESS) lsi.projection = parse_projection(lproj);
+            def.local_secondary_indexes.push_back(std::move(lsi));
         }
     }
 

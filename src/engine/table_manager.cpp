@@ -101,8 +101,9 @@ std::expected<void, TableError> TableManager::check_collection_limit(const std::
 namespace {
 
 constexpr uint32_t kMetadataMagic = 0x4359544D;  // "CYTM"
-// v2 appends a per-table TTL block; v1 files (no TTL) still load.
-constexpr uint32_t kMetadataVersion = 2;
+// v2 appends a per-table TTL block; v3 appends GSI/LSI definitions. Older files
+// (without those trailing blocks) still load.
+constexpr uint32_t kMetadataVersion = 3;
 
 void write_u32(std::ostream& os, uint32_t v) {
     os.write(reinterpret_cast<const char*>(&v), sizeof(v));
@@ -180,6 +181,32 @@ void TableManager::save_metadata() {
             } else {
                 write_u8(os, 0);
             }
+
+            // v3: secondary indexes. A key schema + projection block per index.
+            auto write_key_schema = [&](const std::vector<core::KeySchemaElement>& schema) {
+                write_u32(os, static_cast<uint32_t>(schema.size()));
+                for (const auto& ks : schema) {
+                    write_str(os, ks.attribute_name);
+                    write_u8(os, static_cast<uint8_t>(ks.key_type));
+                }
+            };
+            auto write_projection = [&](const core::Projection& p) {
+                write_u8(os, static_cast<uint8_t>(p.projection_type));
+                write_u32(os, static_cast<uint32_t>(p.non_key_attributes.size()));
+                for (const auto& a : p.non_key_attributes) write_str(os, a);
+            };
+            write_u32(os, static_cast<uint32_t>(def.global_secondary_indexes.size()));
+            for (const auto& gsi : def.global_secondary_indexes) {
+                write_str(os, gsi.index_name);
+                write_key_schema(gsi.key_schema);
+                write_projection(gsi.projection);
+            }
+            write_u32(os, static_cast<uint32_t>(def.local_secondary_indexes.size()));
+            for (const auto& lsi : def.local_secondary_indexes) {
+                write_str(os, lsi.index_name);
+                write_key_schema(lsi.key_schema);
+                write_projection(lsi.projection);
+            }
         }
     }
     // Atomically replace so a crash mid-write never leaves a corrupt catalog.
@@ -242,6 +269,49 @@ void TableManager::load_metadata() {
                 if (!read_u8(is, enabled) || !read_str(is, spec.attribute_name)) return;
                 spec.enabled = enabled != 0;
                 def.ttl_specification = spec;
+            }
+        }
+
+        if (version >= 3) {
+            auto read_key_schema = [&](std::vector<core::KeySchemaElement>& schema) -> bool {
+                uint32_t n = 0;
+                if (!read_u32(is, n)) return false;
+                for (uint32_t k = 0; k < n; ++k) {
+                    core::KeySchemaElement ks;
+                    uint8_t kt = 0;
+                    if (!read_str(is, ks.attribute_name) || !read_u8(is, kt)) return false;
+                    ks.key_type = static_cast<core::KeyType>(kt);
+                    schema.push_back(std::move(ks));
+                }
+                return true;
+            };
+            auto read_projection = [&](core::Projection& p) -> bool {
+                uint8_t pt = 0;
+                uint32_t n = 0;
+                if (!read_u8(is, pt) || !read_u32(is, n)) return false;
+                p.projection_type = static_cast<core::ProjectionType>(pt);
+                for (uint32_t k = 0; k < n; ++k) {
+                    std::string a;
+                    if (!read_str(is, a)) return false;
+                    p.non_key_attributes.push_back(std::move(a));
+                }
+                return true;
+            };
+            uint32_t gsi_count = 0;
+            if (!read_u32(is, gsi_count)) return;
+            for (uint32_t g = 0; g < gsi_count; ++g) {
+                core::GlobalSecondaryIndex gsi;
+                if (!read_str(is, gsi.index_name) || !read_key_schema(gsi.key_schema) ||
+                    !read_projection(gsi.projection)) return;
+                def.global_secondary_indexes.push_back(std::move(gsi));
+            }
+            uint32_t lsi_count = 0;
+            if (!read_u32(is, lsi_count)) return;
+            for (uint32_t li = 0; li < lsi_count; ++li) {
+                core::LocalSecondaryIndex lsi;
+                if (!read_str(is, lsi.index_name) || !read_key_schema(lsi.key_schema) ||
+                    !read_projection(lsi.projection)) return;
+                def.local_secondary_indexes.push_back(std::move(lsi));
             }
         }
 

@@ -134,6 +134,46 @@ std::string serialize_table_description(const core::TableDefinition& def) {
     }
     out += "]";
 
+    auto projection_str = [](core::ProjectionType t) -> std::string {
+        switch (t) {
+            case core::ProjectionType::KEYS_ONLY: return "KEYS_ONLY";
+            case core::ProjectionType::INCLUDE: return "INCLUDE";
+            default: return "ALL";
+        }
+    };
+    auto index_schema_json = [&](const std::vector<core::KeySchemaElement>& schema) {
+        std::string s = "[";
+        for (size_t i = 0; i < schema.size(); ++i) {
+            if (i) s += ",";
+            s += "{\"AttributeName\":\"" + schema[i].attribute_name + "\",\"KeyType\":\"" +
+                 key_type_str(schema[i].key_type) + "\"}";
+        }
+        return s + "]";
+    };
+
+    if (!def.global_secondary_indexes.empty()) {
+        out += ",\"GlobalSecondaryIndexes\":[";
+        for (size_t i = 0; i < def.global_secondary_indexes.size(); ++i) {
+            const auto& g = def.global_secondary_indexes[i];
+            if (i) out += ",";
+            out += "{\"IndexName\":\"" + g.index_name + "\",\"IndexStatus\":\"ACTIVE\",\"KeySchema\":" +
+                   index_schema_json(g.key_schema) + ",\"Projection\":{\"ProjectionType\":\"" +
+                   projection_str(g.projection.projection_type) + "\"}}";
+        }
+        out += "]";
+    }
+    if (!def.local_secondary_indexes.empty()) {
+        out += ",\"LocalSecondaryIndexes\":[";
+        for (size_t i = 0; i < def.local_secondary_indexes.size(); ++i) {
+            const auto& l = def.local_secondary_indexes[i];
+            if (i) out += ",";
+            out += "{\"IndexName\":\"" + l.index_name + "\",\"KeySchema\":" +
+                   index_schema_json(l.key_schema) + ",\"Projection\":{\"ProjectionType\":\"" +
+                   projection_str(l.projection.projection_type) + "\"}}";
+        }
+        out += "]";
+    }
+
     out += ",\"ItemCount\":0";
     out += ",\"TableArn\":\"arn:aws:dynamodb:ddblocal:000000000000:table/" + def.table_name + "\"";
     out += "}";
@@ -196,6 +236,112 @@ bool item_is_expired(const core::TableDefinition& def, const AttributeMap& item)
     long long ts = std::strtoll(s.c_str(), &end, 10);
     if (end != s.c_str() + s.size()) return false;  // non-integer TTL is ignored
     return ts <= now_epoch_seconds();
+}
+
+// ---- Secondary-index maintenance ----------------------------------------
+
+// A unified view of a GSI or LSI for index maintenance / querying.
+struct IndexSpec {
+    std::string name;
+    std::vector<core::KeySchemaElement> key_schema;  // [hash] or [hash, range]
+    core::Projection projection;
+};
+
+std::vector<IndexSpec> all_indexes(const core::TableDefinition& def) {
+    std::vector<IndexSpec> out;
+    for (const auto& g : def.global_secondary_indexes) out.push_back({g.index_name, g.key_schema, g.projection});
+    for (const auto& l : def.local_secondary_indexes) out.push_back({l.index_name, l.key_schema, l.projection});
+    return out;
+}
+
+const IndexSpec* find_index(const std::vector<IndexSpec>& idxs, std::string_view name, IndexSpec& storage) {
+    for (const auto& i : idxs) {
+        if (i.name == name) { storage = i; return &storage; }
+    }
+    return nullptr;
+}
+
+// Index entries live in a reserved storage table; \x1d cannot appear in a real
+// DynamoDB table name, so the namespace can never collide with a base table.
+std::string index_storage_table(const std::string& base, const std::string& index_name) {
+    return base + "\x1d" + index_name;
+}
+
+// Order-preserving storage key for an index entry: index hash, index range, then the
+// base table keys (so non-unique index keys stay distinct and ordered by index range).
+std::string encode_index_storage_key(const IndexSpec& idx, const core::TableDefinition& base,
+                                     const AttributeMap& item) {
+    std::string out;
+    for (const auto& ks : idx.key_schema) {
+        auto it = item.find(ks.attribute_name);
+        if (it != item.end() && it->second) engine::encode_key_component(out, *it->second);
+        else { out.push_back('\0'); out.push_back('\0'); }
+    }
+    for (const auto& ks : base.key_schema) {
+        auto it = item.find(ks.attribute_name);
+        if (it != item.end() && it->second) engine::encode_key_component(out, *it->second);
+        else { out.push_back('\0'); out.push_back('\0'); }
+    }
+    return out;
+}
+
+// Projects an item into an index entry, or nullopt if the item lacks the index key
+// attributes (a sparse index simply omits such items).
+std::optional<AttributeMap> project_for_index(const AttributeMap& item, const IndexSpec& idx,
+                                              const core::TableDefinition& base) {
+    for (const auto& ks : idx.key_schema) {
+        auto it = item.find(ks.attribute_name);
+        if (it == item.end() || !it->second) return std::nullopt;  // sparse
+    }
+    AttributeMap out;
+    auto copy_attr = [&](const std::string& name) {
+        auto it = item.find(name);
+        if (it != item.end()) out[name] = it->second;
+    };
+    // Base + index key attributes are always present in an index entry.
+    for (const auto& ks : base.key_schema) copy_attr(ks.attribute_name);
+    for (const auto& ks : idx.key_schema) copy_attr(ks.attribute_name);
+    if (idx.projection.projection_type == core::ProjectionType::ALL) {
+        out = item;
+    } else if (idx.projection.projection_type == core::ProjectionType::INCLUDE) {
+        for (const auto& a : idx.projection.non_key_attributes) copy_attr(a);
+    }
+    return out;
+}
+
+// Builds a LastEvaluatedKey JSON containing the index key + base key attributes.
+std::string index_key_only_json(const IndexSpec& idx, const core::TableDefinition& def,
+                                const AttributeMap& item) {
+    AttributeMap key;
+    for (const auto& ks : idx.key_schema) {
+        auto it = item.find(ks.attribute_name);
+        if (it != item.end()) key[it->first] = it->second;
+    }
+    for (const auto& ks : def.key_schema) {
+        auto it = item.find(ks.attribute_name);
+        if (it != item.end()) key[it->first] = it->second;
+    }
+    return json::JsonSerializer::serialize_item(key);
+}
+
+// Keeps every GSI/LSI consistent with a base-item change (old/new may be null).
+void maintain_indexes(engine::StorageEngine& storage, const core::TableDefinition& def,
+                      const AttributeMap* old_item, const AttributeMap* new_item) {
+    auto idxs = all_indexes(def);
+    if (idxs.empty()) return;
+    for (const auto& idx : idxs) {
+        const std::string tbl = index_storage_table(def.table_name, idx.name);
+        if (old_item) {
+            if (auto proj = project_for_index(*old_item, idx, def)) {
+                storage.remove(tbl, encode_index_storage_key(idx, def, *old_item));
+            }
+        }
+        if (new_item) {
+            if (auto proj = project_for_index(*new_item, idx, def)) {
+                storage.put(tbl, encode_index_storage_key(idx, def, *new_item), *proj);
+            }
+        }
+    }
 }
 
 std::optional<size_t> read_limit(simdjson::dom::element doc) {
@@ -508,6 +654,10 @@ ApiResult handle_delete_table(engine::TableManager& tables, engine::StorageEngin
                      "Requested resource not found: Table: " + std::string(name) + " not found");
     }
     storage.drop_table(std::string(name));
+    // Purge each secondary index's storage namespace too.
+    for (const auto& idx : all_indexes(*removed)) {
+        storage.drop_table(index_storage_table(removed->table_name, idx.name));
+    }
     return ok("{\"TableDescription\":" + serialize_table_description(*removed) + "}");
 }
 
@@ -656,6 +806,8 @@ ApiResult handle_put_item(engine::TableManager& tables, engine::StorageEngine& s
     if (parse_error) return error(400, "ValidationException", "Invalid ConditionExpression");
     if (condition_failed) return error(400, "ConditionalCheckFailedException", "The conditional request failed");
 
+    maintain_indexes(storage, *def, outcome.previous ? &*outcome.previous : nullptr, &*item);
+
     if (return_values == "ALL_OLD" && outcome.previous) {
         return ok("{\"Attributes\":" + json::JsonSerializer::serialize_item(*outcome.previous) + "}");
     }
@@ -763,6 +915,8 @@ ApiResult handle_delete_item(engine::TableManager& tables, engine::StorageEngine
     if (parse_error) return error(400, "ValidationException", "Invalid ConditionExpression");
     if (condition_failed) return error(400, "ConditionalCheckFailedException", "The conditional request failed");
 
+    if (outcome.previous) maintain_indexes(storage, *def, &*outcome.previous, nullptr);
+
     if (return_values == "ALL_OLD" && outcome.previous) {
         return ok("{\"Attributes\":" + json::JsonSerializer::serialize_item(*outcome.previous) + "}");
     }
@@ -841,6 +995,8 @@ ApiResult handle_update_item(engine::TableManager& tables, engine::StorageEngine
     if (condition_failed) return error(400, "ConditionalCheckFailedException", "The conditional request failed");
     if (!update_error.empty()) return error(400, "ValidationException", update_error);
 
+    maintain_indexes(storage, *def, outcome.previous ? &*outcome.previous : nullptr, &new_item);
+
     if (return_values == "ALL_NEW" || return_values == "UPDATED_NEW") {
         return ok("{\"Attributes\":" + json::JsonSerializer::serialize_item(new_item) + "}");
     }
@@ -862,9 +1018,30 @@ ApiResult handle_scan(engine::TableManager& tables, engine::StorageEngine& stora
                      "Requested resource not found: Table: " + std::string(name) + " not found");
     }
 
+    // Scanning a secondary index reads its storage namespace; the cursor and
+    // LastEvaluatedKey are then expressed over the index + base key attributes.
+    std::string scan_table = std::string(name);
+    const IndexSpec* idx = nullptr;
+    IndexSpec idx_storage;
+    std::string_view index_name;
+    if (doc["IndexName"].get_string().get(index_name) == simdjson::SUCCESS) {
+        idx = find_index(all_indexes(*def), index_name, idx_storage);
+        if (!idx) return error(400, "ValidationException",
+                               "The table does not have the specified index: " + std::string(index_name));
+        scan_table = index_storage_table(std::string(name), std::string(index_name));
+    }
+
     size_t limit = read_limit(doc).value_or(0);
-    auto start = read_start_key(doc, *def);
-    auto result = storage.scan(std::string(name), start, limit);
+    std::optional<std::string> start;
+    if (idx) {
+        simdjson::dom::element esk_el;
+        if (doc["ExclusiveStartKey"].get(esk_el) == simdjson::SUCCESS) {
+            if (auto esk_map = parse_attribute_map(esk_el)) start = encode_index_storage_key(*idx, *def, *esk_map);
+        }
+    } else {
+        start = read_start_key(doc, *def);
+    }
+    auto result = storage.scan(scan_table, start, limit);
 
     std::string_view filter_view;
     const bool has_filter = doc["FilterExpression"].get_string().get(filter_view) == simdjson::SUCCESS;
@@ -877,7 +1054,7 @@ ApiResult handle_scan(engine::TableManager& tables, engine::StorageEngine& stora
 
     std::vector<AttributeMap> output;
     for (const auto& item : result.items) {
-        if (item_is_expired(*def, item)) continue;  // TTL: expired items are not returned
+        if (!idx && item_is_expired(*def, item)) continue;  // TTL applies to base-table scans
         if (has_filter) {
             int r = evaluate_boolean_expr(filter, item, names, *values_opt);
             if (r < 0) return error(400, "ValidationException", "Invalid FilterExpression");
@@ -898,8 +1075,112 @@ ApiResult handle_scan(engine::TableManager& tables, engine::StorageEngine& stora
                       ",\"Count\":" + std::to_string(output.size()) +
                       ",\"ScannedCount\":" + std::to_string(result.items.size());
     if (result.last_evaluated_key && !result.items.empty()) {
-        out += ",\"LastEvaluatedKey\":" + key_only_json(*def, result.items.back());
+        out += ",\"LastEvaluatedKey\":" +
+               (idx ? index_key_only_json(*idx, *def, result.items.back()) : key_only_json(*def, result.items.back()));
     }
+    out += "}";
+    return ok(std::move(out));
+}
+
+ApiResult handle_index_query(engine::StorageEngine& storage,
+                             const core::TableDefinition& def, const std::string& index_name,
+                             simdjson::dom::element doc) {
+    IndexSpec idx_storage;
+    const IndexSpec* idx = find_index(all_indexes(def), index_name, idx_storage);
+    if (!idx) {
+        return error(400, "ValidationException",
+                     "The table does not have the specified index: " + index_name);
+    }
+    if (idx->key_schema.empty()) {
+        return error(400, "ValidationException", "Index has no key schema: " + index_name);
+    }
+
+    NameMap names = parse_expr_names(doc);
+    auto values_opt = parse_expr_values(doc);
+    if (!values_opt) return error(400, "ValidationException", "Invalid ExpressionAttributeValues");
+
+    std::string_view kce_view;
+    if (doc["KeyConditionExpression"].get_string().get(kce_view) != simdjson::SUCCESS) {
+        return error(400, "ValidationException", "Querying an index requires KeyConditionExpression");
+    }
+    auto parsed = parse_key_condition(std::string(kce_view), names, *values_opt);
+    if (!parsed.ok) {
+        return error(400, "ValidationException", parsed.error.empty() ? "Invalid KeyConditionExpression" : parsed.error);
+    }
+    // The KCE partition key must be the index hash key.
+    if (parsed.pk_name != idx->key_schema[0].attribute_name) {
+        return error(400, "ValidationException",
+                     "KeyConditionExpression partition key must be the index hash key");
+    }
+
+    const std::string storage_tbl = index_storage_table(def.table_name, index_name);
+    AttributeMap pk_condition;
+    pk_condition[parsed.pk_name] = parsed.pk_value;
+    auto result = storage.query(storage_tbl, pk_condition, std::nullopt, 0);
+
+    bool forward = true;
+    auto sif_rc = doc["ScanIndexForward"].get_bool().get(forward); (void)sif_rc;
+
+    std::vector<AttributeMap> matched;
+    for (auto& item : result.items) {
+        if (parsed.sort.present) {
+            auto it = item.find(parsed.sk_name);
+            if (it == item.end() || !sort_matches(it->second, parsed.sort)) continue;
+        }
+        matched.push_back(std::move(item));
+    }
+    if (!forward) std::reverse(matched.begin(), matched.end());
+
+    // ExclusiveStartKey carries the index + base key attributes.
+    size_t begin_idx = 0;
+    simdjson::dom::element esk_el;
+    if (doc["ExclusiveStartKey"].get(esk_el) == simdjson::SUCCESS) {
+        if (auto esk_map = parse_attribute_map(esk_el)) {
+            std::string esk = encode_index_storage_key(*idx, def, *esk_map);
+            for (; begin_idx < matched.size(); ++begin_idx) {
+                std::string ek = encode_index_storage_key(*idx, def, matched[begin_idx]);
+                bool past = forward ? (ek > esk) : (ek < esk);
+                if (past) break;
+            }
+        }
+    }
+
+    size_t limit = read_limit(doc).value_or(0);
+    std::string_view filter_view;
+    const bool has_filter = doc["FilterExpression"].get_string().get(filter_view) == simdjson::SUCCESS;
+    const std::string filter(filter_view);
+    std::string_view projection_view;
+    const bool has_projection = doc["ProjectionExpression"].get_string().get(projection_view) == simdjson::SUCCESS;
+
+    std::vector<AttributeMap> output;
+    size_t examined = 0;
+    std::optional<std::string> last_evaluated;
+    for (size_t i = begin_idx; i < matched.size(); ++i) {
+        if (limit != 0 && examined == limit) {
+            last_evaluated = index_key_only_json(*idx, def, matched[i - 1]);
+            break;
+        }
+        ++examined;
+        const auto& item = matched[i];
+        if (has_filter) {
+            int r = evaluate_boolean_expr(filter, item, names, *values_opt);
+            if (r < 0) return error(400, "ValidationException", "Invalid FilterExpression");
+            if (r == 0) continue;
+        }
+        if (has_projection) {
+            bool unsupported = false;
+            AttributeMap projected = apply_projection(item, std::string(projection_view), names, unsupported);
+            if (unsupported) return error(400, "ValidationException", "Document-path ProjectionExpression is not yet supported");
+            output.push_back(std::move(projected));
+        } else {
+            output.push_back(item);
+        }
+    }
+
+    std::string out = "{\"Items\":" + items_to_json(output) +
+                      ",\"Count\":" + std::to_string(output.size()) +
+                      ",\"ScannedCount\":" + std::to_string(examined);
+    if (last_evaluated) out += ",\"LastEvaluatedKey\":" + *last_evaluated;
     out += "}";
     return ok(std::move(out));
 }
@@ -914,6 +1195,12 @@ ApiResult handle_query(engine::TableManager& tables, engine::StorageEngine& stor
     if (!def) {
         return error(400, "ResourceNotFoundException",
                      "Requested resource not found: Table: " + std::string(name) + " not found");
+    }
+
+    // Querying a secondary index reads from the index's storage namespace.
+    std::string_view index_name;
+    if (doc["IndexName"].get_string().get(index_name) == simdjson::SUCCESS) {
+        return handle_index_query(storage, *def, std::string(index_name), doc);
     }
 
     NameMap names = parse_expr_names(doc);
@@ -1089,8 +1376,18 @@ ApiResult handle_batch_write_item(engine::TableManager& tables, engine::StorageE
         }
     }
     for (auto& op : ops) {
-        if (op.is_delete) storage.remove(op.table, op.key);
-        else storage.put(op.table, op.key, op.item);
+        auto def = tables.describe_table(op.table);
+        const bool has_idx = def && (!def->global_secondary_indexes.empty() ||
+                                     !def->local_secondary_indexes.empty());
+        std::optional<AttributeMap> old;
+        if (has_idx) old = storage.get(op.table, op.key);
+        if (op.is_delete) {
+            storage.remove(op.table, op.key);
+            if (has_idx) maintain_indexes(storage, *def, old ? &*old : nullptr, nullptr);
+        } else {
+            storage.put(op.table, op.key, op.item);
+            if (has_idx) maintain_indexes(storage, *def, old ? &*old : nullptr, &op.item);
+        }
     }
     return ok("{\"UnprocessedItems\":{}}");
 }
@@ -1254,14 +1551,22 @@ ApiResult handle_transact_write_items(engine::TableManager& tables, engine::Stor
     // Phase 2: apply all writes. Updates use the item computed in phase 1.
     for (size_t i = 0; i < actions.size(); ++i) {
         const auto& a = actions[i];
+        if (a.kind == 3) continue;  // ConditionCheck performs no write
+        auto def = tables.describe_table(a.table);
+        const bool has_idx = def && (!def->global_secondary_indexes.empty() ||
+                                     !def->local_secondary_indexes.empty());
+        std::optional<AttributeMap> old;
+        if (has_idx) old = storage.get(a.table, a.key);
         if (a.kind == 0) {
             storage.put(a.table, a.key, a.item);
+            if (has_idx) maintain_indexes(storage, *def, old ? &*old : nullptr, &a.item);
         } else if (a.kind == 1) {
             storage.remove(a.table, a.key);
+            if (has_idx) maintain_indexes(storage, *def, old ? &*old : nullptr, nullptr);
         } else if (a.kind == 2) {
             storage.put(a.table, a.key, precomputed_updates[i]);
+            if (has_idx) maintain_indexes(storage, *def, old ? &*old : nullptr, &precomputed_updates[i]);
         }
-        // kind == 3 (ConditionCheck) performs no write.
     }
     return ok("{}");
 }
