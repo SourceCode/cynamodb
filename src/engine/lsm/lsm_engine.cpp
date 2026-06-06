@@ -204,9 +204,7 @@ LsmEngine::~LsmEngine() {
     manifest_->save();
 }
 
-void LsmEngine::put(const std::string& table_name, const std::string& key, const AttributeMap& attributes) {
-    std::unique_lock lock(mutex_);
-    const std::string ik = internal_key(table_name, key);
+void LsmEngine::put_locked(const std::string& ik, const AttributeMap& attributes) {
     append_to_wal(ik, false, attributes);
     memtable_->put(ik, attributes);
     if (memtable_->size() >= memtable_flush_threshold_) {
@@ -222,17 +220,12 @@ void LsmEngine::put(const std::string& table_name, const std::string& key, const
     }
 }
 
-void LsmEngine::remove(const std::string& table_name, const std::string& key) {
-    std::unique_lock lock(mutex_);
-    const std::string ik = internal_key(table_name, key);
+void LsmEngine::remove_locked(const std::string& ik) {
     append_to_wal(ik, true, {});
     memtable_->remove(ik);
 }
 
-std::optional<StorageEngine::AttributeMap> LsmEngine::get(const std::string& table_name, const std::string& key) {
-    const std::string ik = internal_key(table_name, key);
-    std::shared_lock lock(mutex_);
-
+std::optional<StorageEngine::AttributeMap> LsmEngine::get_locked(const std::string& ik) const {
     // Read newest level to oldest. The first level that knows about the key is
     // authoritative: a live value is returned, a tombstone stops the search and
     // returns "not found" rather than falling through to an older, stale value.
@@ -252,6 +245,56 @@ std::optional<StorageEngine::AttributeMap> LsmEngine::get(const std::string& tab
     }
 
     return std::nullopt;
+}
+
+void LsmEngine::put(const std::string& table_name, const std::string& key, const AttributeMap& attributes) {
+    std::unique_lock lock(mutex_);
+    put_locked(internal_key(table_name, key), attributes);
+}
+
+void LsmEngine::remove(const std::string& table_name, const std::string& key) {
+    std::unique_lock lock(mutex_);
+    remove_locked(internal_key(table_name, key));
+}
+
+std::optional<StorageEngine::AttributeMap> LsmEngine::get(const std::string& table_name, const std::string& key) {
+    std::shared_lock lock(mutex_);
+    return get_locked(internal_key(table_name, key));
+}
+
+LsmEngine::MutationOutcome LsmEngine::mutate(const std::string& table_name, const std::string& key, const Mutator& mutator) {
+    std::unique_lock lock(mutex_);
+    const std::string ik = internal_key(table_name, key);
+    MutationOutcome outcome;
+    auto current = get_locked(ik);
+    if (current) outcome.previous = current;
+
+    Mutation m = mutator(current ? &*current : nullptr);
+    switch (m.kind) {
+        case MutationKind::Put:
+            put_locked(ik, m.attributes);
+            outcome.applied = true;
+            break;
+        case MutationKind::Delete:
+            remove_locked(ik);
+            outcome.applied = true;
+            break;
+        case MutationKind::None:
+            break;
+    }
+    return outcome;
+}
+
+void LsmEngine::drop_table(const std::string& table_name) {
+    std::unique_lock lock(mutex_);
+    // The LSM keeps all tables in one keyspace, so dropping a table means
+    // tombstoning every key under its prefix. Compaction later reclaims the space.
+    auto live = materialize();
+    const std::string prefix = table_prefix(table_name);
+    for (auto it = live.lower_bound(prefix); it != live.end(); ++it) {
+        if (it->first.compare(0, prefix.size(), prefix) != 0) break;
+        remove_locked(it->first);
+    }
 }
 
 // Builds a merged, tombstone-resolved, sorted view of the whole table by reading

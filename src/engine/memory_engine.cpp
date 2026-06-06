@@ -73,6 +73,35 @@ std::optional<StorageEngine::AttributeMap> MemoryEngine::get(const std::string& 
     return item_it->second;
 }
 
+MemoryEngine::MutationOutcome MemoryEngine::mutate(const std::string& table_name, const std::string& key, const Mutator& mutator) {
+    std::unique_lock lock(mutex_);
+    MutationOutcome outcome;
+    auto& table = data_[table_name];
+    auto it = table.find(key);
+    const AttributeMap* current = (it != table.end()) ? &it->second : nullptr;
+    if (current) outcome.previous = *current;
+
+    Mutation m = mutator(current);
+    switch (m.kind) {
+        case MutationKind::Put:
+            table[key] = std::move(m.attributes);
+            outcome.applied = true;
+            break;
+        case MutationKind::Delete:
+            if (it != table.end()) table.erase(it);
+            outcome.applied = true;
+            break;
+        case MutationKind::None:
+            break;
+    }
+    return outcome;
+}
+
+void MemoryEngine::drop_table(const std::string& table_name) {
+    std::unique_lock lock(mutex_);
+    data_.erase(table_name);
+}
+
 MemoryEngine::ScanResult MemoryEngine::scan(const std::string& table_name, const std::optional<std::string>& exclusive_start_key, size_t limit) {
     ScanResult result;
     std::shared_lock lock(mutex_);

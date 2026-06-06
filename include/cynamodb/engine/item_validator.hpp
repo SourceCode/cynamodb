@@ -13,6 +13,7 @@ enum class ValidationError {
     InvalidAttributeName,
     NestingDepthExceeded,
     TypeMismatchForKey,
+    EmptyKeyAttribute,
     ProvisionedThroughputExceeded
 };
 

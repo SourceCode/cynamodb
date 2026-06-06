@@ -111,13 +111,24 @@ std::expected<void, ValidationError> ItemValidator::validate_item_standard(
     // Key Type Validation
     for (const auto& ks : table_def.key_schema) {
         auto it = item.find(ks.attribute_name);
-        if (it == item.end()) return std::unexpected(ValidationError::TypeMismatchForKey); // Missing key
-        
+        if (it == item.end() || !it->second) return std::unexpected(ValidationError::TypeMismatchForKey); // Missing key
+
         auto def_it = table_def.attribute_definitions.find(ks.attribute_name);
         if (def_it != table_def.attribute_definitions.end()) {
             if (it->second->type != def_it->second) {
                 return std::unexpected(ValidationError::TypeMismatchForKey);
             }
+        }
+
+        // AWS rejects empty String/Binary values in key attributes; accepting them
+        // would mask client bugs that fail against real DynamoDB.
+        if (it->second->type == core::AttributeType::S &&
+            std::get<core::String>(it->second->value).empty()) {
+            return std::unexpected(ValidationError::EmptyKeyAttribute);
+        }
+        if (it->second->type == core::AttributeType::B &&
+            std::get<std::pmr::vector<uint8_t>>(it->second->value).empty()) {
+            return std::unexpected(ValidationError::EmptyKeyAttribute);
         }
     }
 

@@ -1,36 +1,47 @@
-# AGENTS.md - Technical Specification for AI Agents (v2.1.2)
+# AGENTS.md - Technical Specification for AI Agents (v2.3.0)
 
 ## Overview
-cynamoDB is a high-performance, local DynamoDB-compatible database engine written in C++23. It provides 1:1 API compatibility with Amazon DynamoDB, enabling local development, testing, and edge computing without relying on the AWS cloud.
+cynamoDB is a high-performance, local DynamoDB-compatible database engine written in C++23. It speaks the DynamoDB HTTP/JSON wire protocol so AWS SDKs and the CLI work against it for local development, testing, and CI.
+
+> **Read this before architecting against cynamoDB.** The table below is the source of
+> truth for what is implemented. The authoritative, contract-tested matrix lives in
+> [docs/api.md](docs/api.md#api-compliance-status); do not assume a feature exists because
+> DynamoDB has it.
 
 ## Capabilities Mapping
 
-| Feature | Description | Purpose |
-|---------|-------------|---------|
-| **DynamoDB API Parity** | Supports core DynamoDB operations (CRUD, Query, Scan, Batch). | Drop-in replacement for AWS DynamoDB in local/CI environments. |
-| **LSM Tree Storage** | High-throughput persistence layer using Log-Structured Merge-trees. | Efficient writes and optimized range scans (Sort Keys). |
-| **Expression Engine** | Full AST-based parser for Condition, Update, and Filter expressions. | Implements complex DynamoDB logic identically to AWS. |
-| **SigV4 Authentication** | Supports AWS Signature Version 4. | Compatible with standard AWS SDKs and CLI. |
-| **DynamoDB Streams** | Capture item-level changes in chronological order. | Enables event-driven architectures and triggers locally. |
-| **ACID Transactions** | `TransactWriteItems` and `TransactGetItems` support. | Ensures data integrity across multiple items and tables. |
-| **TTL Engine** | Automatic expiration of items based on a timestamp attribute. | Managed data retention and cleanup. |
-| **Secondary Indexes** | GSI (Global) and LSI (Local) support. | Flexible data access patterns beyond the primary key. |
+| Feature | Status | Notes |
+|---------|--------|-------|
+| **Item CRUD** | ✅ Implemented | `PutItem`/`GetItem`/`UpdateItem`/`DeleteItem`, all attribute types (S/N/B/BOOL/NULL/M/L/SS/NS/BS), persisted across restarts and SSTable flushes. |
+| **Conditional writes** | ✅ Implemented | `ConditionExpression` on Put/Delete/Update; `ReturnValues`. |
+| **Query & Scan** | ✅ Implemented | `KeyConditionExpression` (+ legacy `KeyConditions`), sort-key range operators, `FilterExpression`, `ProjectionExpression` (top-level), `ScanIndexForward`, pagination. |
+| **Batch & Transactions** | ✅ Implemented | `BatchGetItem`/`BatchWriteItem`; `TransactWriteItems` (all-or-nothing) / `TransactGetItems`. |
+| **Table lifecycle** | ✅ Implemented | `CreateTable`/`DescribeTable`/`ListTables`/`DeleteTable`/`UpdateTable` (minimal). |
+| **LSM Tree Storage** | ✅ Implemented | WAL + memtable + SSTables + compaction; every type survives a flush. |
+| **Expression Engine** | ✅ Implemented | Condition/Filter/Update/KeyCondition. Document paths (`a.b`, `a[0]`) not yet supported. |
+| **SigV4 Authentication** | ⚠️ Optional, partial | `CYNAMODB_REQUIRE_AUTH=1` enforces presence/shape of the SigV4 header; no cryptographic signature verification. |
+| **DynamoDB Streams** | 🚧 Not implemented | Targets return `501 NotImplementedException`. |
+| **TTL Engine** | 🚧 Not implemented | `UpdateTimeToLive`/`DescribeTimeToLive` return `501`; no auto-expiry. |
+| **Secondary Indexes** | 🚧 Not implemented | GSI/LSI definitions are accepted on `CreateTable` but queries cannot target an index. |
+| **Backups / PITR / Global tables / PartiQL** | 🚧 Not implemented | Recognized targets return `501 NotImplementedException`. |
 
 ## Operational Guidance
 
 ### Command-Line Interface (CLI)
-The primary binary is `cynamodb`.
+The primary binary is `cynamodb`. It is configured entirely through environment
+variables (there are no command-line flags):
 
-**Basic Usage:**
 ```bash
-./cynamodb [options]
+CYNAMODB_DATA_DIR=./data CYNAMODB_PORT=8000 ./cynamodb
 ```
 
-**Common Options:**
-- `--port <number>`: Port to listen on (default: 8000).
-- `--data-dir <path>`: Directory for LSM tree persistence (default: `./data`).
-- `--in-memory`: Enable in-memory mode (ephemeral).
-- `--log-level <level>`: Set logging verbosity (trace, debug, info, warn, error).
+**Environment variables:**
+- `CYNAMODB_BIND_ADDR`: Bind address (default `0.0.0.0`).
+- `CYNAMODB_PORT`: Port to listen on (default `8000`).
+- `CYNAMODB_THREADS`: HTTP worker threads (default: hardware concurrency).
+- `CYNAMODB_DATA_DIR`: Directory for LSM persistence (default `./data`).
+- `CYNAMODB_WAL_FSYNC`: Set to `0`/`off` to disable per-write `fdatasync` for throughput.
+- `CYNAMODB_REQUIRE_AUTH`: Set to a truthy value to enforce SigV4 header presence/shape.
 
 ### API Endpoints
 cynamoDB listens on HTTP and responds to the standard DynamoDB JSON protocols (`application/x-amz-json-1.0`).
@@ -39,7 +50,7 @@ cynamoDB listens on HTTP and responds to the standard DynamoDB JSON protocols (`
 - **Headers Required**:
   - `X-Amz-Target`: `DynamoDB_20120810.<OperationName>`
   - `Content-Type`: `application/x-amz-json-1.0`
-  - `Authorization`: SigV4 signature (or stub in dev mode).
+  - `Authorization`: SigV4 signature — only required when `CYNAMODB_REQUIRE_AUTH` is set; ignored otherwise.
 
 ### Example: Create Table
 ```bash
@@ -55,17 +66,19 @@ aws dynamodb create-table \
 
 ### Input Requirements
 - **JSON Format**: Valid DynamoDB JSON payloads.
-- **Data Model**: Partition Key is required; Sort Key is optional.
-- **SigV4**: Requests must be signed unless `--no-auth` or dev-mode override is used.
+- **Data Model**: Partition Key is required; Sort Key is optional. Key attribute values must be non-empty.
+- **SigV4**: Requests are unauthenticated by default; set `CYNAMODB_REQUIRE_AUTH` to enforce.
 
 ### Expected Output Formats
 - **Success**: HTTP 200 OK with the standard DynamoDB response JSON.
 - **Error**: HTTP 400/500 with `__type` and `message` in the body, matching AWS error shapes.
 
 ### Known Limitations
-- **IAM Policies**: Simplified local stub; full IAM resource-based policies are not enforced.
-- **PartiQL**: Basic support for `ExecuteStatement`; advanced ANSI-SQL features may be limited.
-- **Cluster Mode**: Currently optimized for single-node local performance.
+- **Secondary indexes**: GSI/LSI are not queryable (definitions accepted, `IndexName` ignored).
+- **Streams / TTL / Backups / PITR / Global tables / PartiQL**: recognized but return `501 NotImplementedException`.
+- **Document paths**: expressions operate on top-level attributes only.
+- **SigV4**: presence/shape enforcement only; no cryptographic signature verification.
+- **Cluster Mode**: single-node local engine.
 
 ## Agent-Optimized Reference
 - **Engine**: C++23, Boost.Beast, simdjson.

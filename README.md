@@ -1,4 +1,4 @@
-# cynamoDB v2.2.0
+# cynamoDB v2.3.0
 
 cynamoDB is a high-performance, local DynamoDB-compatible database engine written in C++23. It provides 1:1 API compatibility with Amazon DynamoDB, enabling local development, testing, and edge computing without relying on the AWS cloud.
 
@@ -46,7 +46,8 @@ graph TD
    ```
    Recognized variables: `CYNAMODB_BIND_ADDR` (default `0.0.0.0`), `CYNAMODB_PORT`
    (default `8000`), `CYNAMODB_THREADS`, `CYNAMODB_DATA_DIR` (default `./data`),
-   `CYNAMODB_WAL_FSYNC` (`0` to disable per-write fsync for throughput).
+   `CYNAMODB_WAL_FSYNC` (`0` to disable per-write fsync for throughput),
+   `CYNAMODB_REQUIRE_AUTH` (`1` to enforce SigV4 header presence/shape).
 3. **Use with the AWS CLI / SDKs**:
    ```bash
    aws dynamodb create-table --endpoint-url http://localhost:8000 \
@@ -61,17 +62,32 @@ graph TD
 
 ## Supported operations
 
-The HTTP/JSON data plane is implemented end-to-end for the core operations:
+The HTTP/JSON data plane is implemented end-to-end:
 
-- **Tables**: `CreateTable`, `DescribeTable`, `ListTables`
-- **Items**: `PutItem`, `GetItem`, `DeleteItem`
-- **Bulk reads**: `Scan` (with `Limit` / `ExclusiveStartKey` pagination),
-  `Query` (partition-key equality via legacy `KeyConditions`, results sorted by sort key)
+- **Tables**: `CreateTable`, `DescribeTable`, `ListTables`, `DeleteTable`,
+  `UpdateTable` (minimal)
+- **Items**: `PutItem`, `GetItem`, `UpdateItem`, `DeleteItem` — with
+  `ConditionExpression` (returning `ConditionalCheckFailedException`),
+  `UpdateExpression` (`SET`/`REMOVE`/`ADD`/`DELETE`, `+`/`-`, `if_not_exists`,
+  `list_append`), and `ReturnValues`
+- **Bulk reads**: `Scan` and `Query` with `FilterExpression`,
+  `ProjectionExpression`, `Limit`/`ExclusiveStartKey` pagination. `Query` supports
+  modern `KeyConditionExpression` (and legacy `KeyConditions`) with sort-key
+  operators (`=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `begins_with`) and
+  `ScanIndexForward`.
+- **Batch & transactions**: `BatchGetItem`, `BatchWriteItem`,
+  `TransactWriteItems` (all-or-nothing), `TransactGetItems`
 
-Scalar types (`S`, `N`, `BOOL`, `NULL`) and maps (`M`) round-trip over HTTP and persist.
-See [ITEMS_TO_FIX.md](ITEMS_TO_FIX.md) and [tests/TEST_COVERAGE.md](tests/TEST_COVERAGE.md)
-for the current limitations (e.g. `KeyConditionExpression`, `UpdateItem`, conditional
-writes, transactions over HTTP, GSI/LSI, and SigV4 enforcement are not yet wired).
+**All attribute types round-trip and persist**, including across a memtable→SSTable
+flush: `S`, `N`, `B` (base64), `BOOL`, `NULL`, `M`, `L`, `SS`, `NS`, `BS`.
+
+Recognized-but-unimplemented operations (Streams, TTL, backups/PITR, global tables,
+PartiQL, secondary-index queries) return `501 NotImplementedException` so SDK
+feature-detection works. SigV4 enforcement is opt-in via `CYNAMODB_REQUIRE_AUTH=1`.
+
+See [docs/api.md](docs/api.md#api-compliance-status) for the authoritative,
+contract-tested matrix of what is implemented vs. planned, and
+[tests/TEST_COVERAGE.md](tests/TEST_COVERAGE.md) for the coverage map.
 
 ## Durability & persistence
 

@@ -23,7 +23,9 @@ public:
     void put(const std::string& table_name, const std::string& key, const AttributeMap& attributes) override;
     void remove(const std::string& table_name, const std::string& key) override;
     std::optional<AttributeMap> get(const std::string& table_name, const std::string& key) override;
-    
+    MutationOutcome mutate(const std::string& table_name, const std::string& key, const Mutator& mutator) override;
+    void drop_table(const std::string& table_name) override;
+
     ScanResult scan(const std::string& table_name, const std::optional<std::string>& exclusive_start_key, size_t limit) override;
     QueryResult query(const std::string& table_name, const AttributeMap& key_conditions, const std::optional<std::string>& exclusive_start_key, size_t limit) override;
 

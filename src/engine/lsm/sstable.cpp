@@ -1,4 +1,5 @@
 #include <cynamodb/engine/lsm/sstable.hpp>
+#include <cynamodb/engine/lsm/record_codec.hpp>
 #include <cynamodb/utils/crc32.hpp>
 #include <algorithm>
 #include <fstream>
@@ -15,40 +16,11 @@ namespace {
     });
 }
 
-std::string encode_attribute_value(const core::AttributeValue& val) {
-    std::string out;
-    out.push_back(static_cast<char>(val.type));
-    if (val.type == core::AttributeType::S || val.type == core::AttributeType::N) {
-        const auto& s = std::get<core::String>(val.value);
-        uint32_t len = static_cast<uint32_t>(s.size());
-        out.append(reinterpret_cast<const char*>(&len), sizeof(len));
-        out.append(s.data(), s.size());
-    } else if (val.type == core::AttributeType::BOOL) {
-        out.push_back(std::get<bool>(val.value) ? 1 : 0);
-    }
-    return out;
-}
-
-std::shared_ptr<core::AttributeValue> decode_attribute_value(std::string_view& data) {
-    if (data.empty()) return nullptr;
-    auto attr = std::make_shared<core::AttributeValue>();
-    attr->type = static_cast<core::AttributeType>(data[0]);
-    data.remove_prefix(1);
-    if (attr->type == core::AttributeType::S || attr->type == core::AttributeType::N) {
-        if (data.size() < sizeof(uint32_t)) return nullptr;
-        uint32_t len;
-        std::copy(data.data(), data.data() + sizeof(uint32_t), reinterpret_cast<char*>(&len));
-        data.remove_prefix(sizeof(uint32_t));
-        if (data.size() < len) return nullptr;
-        attr->value = core::String(data.substr(0, len));
-        data.remove_prefix(len);
-    } else if (attr->type == core::AttributeType::BOOL) {
-        if (data.empty()) return nullptr;
-        attr->value = (data[0] != 0);
-        data.remove_prefix(1);
-    }
-    return attr;
-}
+// The on-disk attribute codec is the full-fidelity binary format used by the WAL
+// (see record_codec.hpp's encode_attribute_value/decode_attribute_value). Earlier
+// revisions of this file only persisted S/N/BOOL, which silently dropped
+// maps/lists/sets/binary on flush; sharing the codec keeps every attribute type
+// intact across a memtable->SSTable flush.
 
 } // namespace
 

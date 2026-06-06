@@ -23,6 +23,7 @@ public:
 
     std::expected<core::TableDefinition, TableError> create_table(const core::TableDefinition& table_def);
     std::expected<core::TableDefinition, TableError> describe_table(std::string_view table_name);
+    std::expected<core::TableDefinition, TableError> delete_table(std::string_view table_name);
     std::vector<std::string> list_tables();
 
     // Collection size tracking

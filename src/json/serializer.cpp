@@ -1,4 +1,5 @@
 #include <cynamodb/json/serializer.hpp>
+#include <cynamodb/utils/base64.hpp>
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -72,10 +73,38 @@ core::AttributeValue JsonParser::parse_attribute_value(simdjson::dom::element el
         }
         val.value = std::move(list);
     }
-    else if (key == "B") { val.type = core::AttributeType::B; /* Base64 decode placeholder */ val.value = std::pmr::vector<uint8_t>{}; }
-    else if (key == "SS") { val.type = core::AttributeType::SS; val.value = core::StringSet{}; }
-    else if (key == "NS") { val.type = core::AttributeType::NS; val.value = core::NumberSet{}; }
-    else if (key == "BS") { val.type = core::AttributeType::BS; val.value = core::BinarySet{}; }
+    else if (key == "B") {
+        val.type = core::AttributeType::B;
+        auto decoded = utils::base64_decode(it.value().get_string().value());
+        if (!decoded) throw std::invalid_argument("B attribute value is not valid base64");
+        val.value = std::pmr::vector<uint8_t>(decoded->begin(), decoded->end());
+    }
+    else if (key == "SS") {
+        val.type = core::AttributeType::SS;
+        core::StringSet set;
+        for (auto elem : it.value().get_array()) {
+            set.values.push_back(core::String(elem.get_string().value()));
+        }
+        val.value = std::move(set);
+    }
+    else if (key == "NS") {
+        val.type = core::AttributeType::NS;
+        core::NumberSet set;
+        for (auto elem : it.value().get_array()) {
+            set.values.push_back(core::String(elem.get_string().value()));
+        }
+        val.value = std::move(set);
+    }
+    else if (key == "BS") {
+        val.type = core::AttributeType::BS;
+        core::BinarySet set;
+        for (auto elem : it.value().get_array()) {
+            auto decoded = utils::base64_decode(elem.get_string().value());
+            if (!decoded) throw std::invalid_argument("BS attribute value is not valid base64");
+            set.values.emplace_back(decoded->begin(), decoded->end());
+        }
+        val.value = std::move(set);
+    }
     else throw std::invalid_argument("Unsupported type key");
     
     return val;
@@ -141,7 +170,7 @@ core::TableDefinition JsonParser::parse_table_definition(simdjson::dom::element 
 std::string JsonSerializer::serialize_attribute_value(const core::AttributeValue& val) {
     core::String out;
     if (val.type == core::AttributeType::S) out = "{\"S\":\"" + escape_json(std::get<core::String>(val.value)) + "\"}";
-    else if (val.type == core::AttributeType::N) out = "{\"N\":\"" + std::get<core::String>(val.value) + "\"}";
+    else if (val.type == core::AttributeType::N) out = "{\"N\":\"" + escape_json(std::get<core::String>(val.value)) + "\"}";
     else if (val.type == core::AttributeType::BOOL) out = core::String("{\"BOOL\":") + (std::get<bool>(val.value) ? "true" : "false") + "}";
     else if (val.type == core::AttributeType::NUL) out = "{\"NULL\":true}";
     else if (val.type == core::AttributeType::M) {
@@ -153,6 +182,51 @@ std::string JsonSerializer::serialize_attribute_value(const core::AttributeValue
             first = false;
         }
         out += "}}";
+    }
+    else if (val.type == core::AttributeType::L) {
+        out = "{\"L\":[";
+        bool first = true;
+        for (const auto& v : std::get<core::ListValue>(val.value)) {
+            if (!first) out += ",";
+            out += core::String(serialize_attribute_value(*v));
+            first = false;
+        }
+        out += "]}";
+    }
+    else if (val.type == core::AttributeType::B) {
+        out = "{\"B\":\"" +
+              core::String(utils::base64_encode_bytes(std::get<std::pmr::vector<uint8_t>>(val.value))) +
+              "\"}";
+    }
+    else if (val.type == core::AttributeType::SS) {
+        out = "{\"SS\":[";
+        bool first = true;
+        for (const auto& s : std::get<core::StringSet>(val.value).values) {
+            if (!first) out += ",";
+            out += "\"" + escape_json(s) + "\"";
+            first = false;
+        }
+        out += "]}";
+    }
+    else if (val.type == core::AttributeType::NS) {
+        out = "{\"NS\":[";
+        bool first = true;
+        for (const auto& s : std::get<core::NumberSet>(val.value).values) {
+            if (!first) out += ",";
+            out += "\"" + escape_json(s) + "\"";  // escaped: N values are not validated as numeric on ingest
+            first = false;
+        }
+        out += "]}";
+    }
+    else if (val.type == core::AttributeType::BS) {
+        out = "{\"BS\":[";
+        bool first = true;
+        for (const auto& b : std::get<core::BinarySet>(val.value).values) {
+            if (!first) out += ",";
+            out += "\"" + core::String(utils::base64_encode_bytes(b)) + "\"";
+            first = false;
+        }
+        out += "]}";
     }
     else out = "{\"NULL\":true}";
     return std::string(out);

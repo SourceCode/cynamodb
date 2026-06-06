@@ -185,6 +185,52 @@ std::expected<std::shared_ptr<ASTNode>, ParserError> Parser::parse_comparison(si
         return node;
     }
 
+    // `operand BETWEEN lo AND hi` -> FunctionCallNode{"BETWEEN", {operand, lo, hi}}.
+    if (match_keyword("BETWEEN")) {
+        auto lo = parse_primary(depth + 1);
+        if (!lo) return lo;
+        if (!match_keyword("AND")) {
+            return std::unexpected(ParserError::UnexpectedToken);
+        }
+        auto hi = parse_primary(depth + 1);
+        if (!hi) return hi;
+        std::vector<std::shared_ptr<ASTNode>> args;
+        args.push_back(std::move(left));
+        args.push_back(std::move(*lo));
+        args.push_back(std::move(*hi));
+        auto node = std::make_unique<ASTNode>();
+        node->data = FunctionCallNode{"BETWEEN", std::move(args)};
+        return node;
+    }
+
+    // `operand IN (a, b, c)` -> FunctionCallNode{"IN", {operand, a, b, c}}.
+    if (match_keyword("IN")) {
+        if (!match(TokenType::OPEN_PAREN)) {
+            return std::unexpected(ParserError::UnexpectedToken);
+        }
+        std::vector<std::shared_ptr<ASTNode>> args;
+        args.push_back(std::move(left));
+        while (true) {
+            if (args.size() > kMaxFunctionArgs) {
+                return std::unexpected(ParserError::InvalidExpression);
+            }
+            auto operand = parse_primary(depth + 1);
+            if (!operand) return operand;
+            args.push_back(std::move(*operand));
+            if (peek().type == TokenType::COMMA) {
+                consume();
+            } else {
+                break;
+            }
+        }
+        if (!match(TokenType::CLOSE_PAREN)) {
+            return std::unexpected(ParserError::UnexpectedToken);
+        }
+        auto node = std::make_unique<ASTNode>();
+        node->data = FunctionCallNode{"IN", std::move(args)};
+        return node;
+    }
+
     return left;
 }
 

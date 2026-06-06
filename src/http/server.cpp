@@ -1,6 +1,8 @@
 #include <cynamodb/http/server.hpp>
 #include <cynamodb/api/dispatcher.hpp>
 #include <cynamodb/api/handlers.hpp>
+#include <cynamodb/auth/sigv4.hpp>
+#include <cynamodb/json/serializer.hpp>
 #include <boost/asio/dispatch.hpp>
 #include <iostream>
 #include <random>
@@ -92,7 +94,7 @@ void HttpSession::on_read(beast::error_code ec, std::size_t bytes_transferred) {
 
 void HttpSession::handle_request() {
     http::response<http::string_body> res{http::status::ok, req_.version()};
-    res.set(http::field::server, "cynamoDB/2.2.0");
+    res.set(http::field::server, "cynamoDB/2.3.0");
     res.set(http::field::content_type, "application/x-amz-json-1.0");
     
     // Request ID
@@ -104,6 +106,11 @@ void HttpSession::handle_request() {
 
     if (req_.target() == "/health") {
         res.body() = "{\"status\":\"healthy\"}";
+    } else if (auto auth_err = check_auth(); auth_err.has_value()) {
+        // Opt-in SigV4 enforcement rejected this request before dispatch.
+        res.result(static_cast<http::status>(auth_err->status));
+        res.set("x-amzn-ErrorType", auth_err->error_type);
+        res.body() = std::move(auth_err->body);
     } else {
         // DynamoDB protocol: POST "/" with the operation in the X-Amz-Target
         // header and a JSON body. Route to the operation handler.
@@ -123,6 +130,29 @@ void HttpSession::handle_request() {
 
     res.prepare_payload();
     do_write(std::move(res));
+}
+
+std::optional<api::ApiResult> HttpSession::check_auth() {
+    if (!ctx_.require_auth) return std::nullopt;
+
+    auto auth_view = req_[http::field::authorization];
+    auto make_error = [](const std::string& type, const std::string& message) {
+        return api::ApiResult{
+            400, "com.amazonaws.dynamodb.v20120810#" + type,
+            json::JsonSerializer::serialize_error("com.amazonaws.dynamodb.v20120810#" + type, message)};
+    };
+
+    if (auth_view.empty()) {
+        return make_error("MissingAuthenticationTokenException",
+                          "Request is missing Authentication Token");
+    }
+    std::string_view auth(auth_view.data(), auth_view.size());
+    auto parsed = auth::SigV4Parser::parse_authorization_header(auth);
+    if (!parsed) {
+        return make_error("IncompleteSignatureException",
+                          "Authorization header requires a valid AWS4-HMAC-SHA256 credential and signature");
+    }
+    return std::nullopt;
 }
 
 void HttpSession::do_write(http::response<http::string_body> res) {

@@ -1,7 +1,7 @@
 /**
  * @file context.hpp
  * @brief Core execution context for cynamoDB.
- * @version 2.1.2
+ * @version 2.3.0
  */
 
 #pragma once
@@ -40,7 +40,16 @@ struct Context {
     std::shared_ptr<streams::StreamManager> stream_manager;
     std::shared_ptr<backups::BackupManager> backup_manager;
     std::mutex transaction_mutex;
+    // Opt-in SigV4 enforcement. When true, requests without a parseable
+    // AWS4-HMAC-SHA256 Authorization header are rejected. Enabled by setting
+    // CYNAMODB_REQUIRE_AUTH to a value other than "0"/"false"/"off"/"" so auth-
+    // required code paths can be exercised locally.
+    bool require_auth = false;
     Context() {
+        if (const char* env = std::getenv("CYNAMODB_REQUIRE_AUTH"); env != nullptr) {
+            std::string_view v(env);
+            require_auth = !(v.empty() || v == "0" || v == "false" || v == "off");
+        }
         std::string data_dir = "./data";
         if (const char* env = std::getenv("CYNAMODB_DATA_DIR"); env != nullptr && env[0] != '\0') data_dir = env;
         std::filesystem::path data_path = std::filesystem::path(data_dir).lexically_normal();

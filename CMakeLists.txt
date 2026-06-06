@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(cynamoDB VERSION 2.2.0 LANGUAGES CXX)
+project(cynamoDB VERSION 2.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -81,6 +81,7 @@ add_library(cynamodb_core STATIC
     src/expressions/lexer.cpp
     src/expressions/parser.cpp
     src/expressions/evaluator.cpp
+    src/expressions/update_expression.cpp
     src/expressions/partiql/parser.cpp
     src/observability/metrics.cpp
     src/engine/recovery/recovery_manager.cpp

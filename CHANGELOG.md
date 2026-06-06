@@ -4,6 +4,68 @@ All notable changes to cynamoDB are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/) and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [2.3.0] - 2026-06-06
+
+This release closes the data-integrity gaps and feature holes surfaced by an
+external audit (`CYNAMODB_FINDINGS.md`). The headline fix: writes are no longer
+silently lost or corrupted. It also fills in the most-used DynamoDB operations
+(`UpdateItem`, conditional writes, batch/transactions, modern query expressions,
+table lifecycle) so much more of a real workload runs unchanged.
+
+### Fixed (data integrity — "fail loud, never silent")
+- **Complex types are no longer silently lost.** The SSTable on-disk codec only
+  persisted `S`/`N`/`BOOL`, so a `Map` vanished entirely after a memtable flush and
+  `L`/`SS`/`NS`/`BS`/`B` were dropped. The SSTable codec now uses the same
+  full-fidelity binary format as the WAL, and every attribute type round-trips and
+  survives a flush. (Finding #1b)
+- **`L`/`SS`/`NS`/`BS`/`B` are no longer coerced to `NULL` on the wire.** The JSON
+  parser now decodes `B`/`BS` from base64 and populates `SS`/`NS`/`BS`, and the
+  serializer emits `L`/`SS`/`NS`/`BS`/`B` instead of degrading them to `{"NULL":true}`.
+  Invalid base64 in a `B`/`BS` value is rejected with `ValidationException`. (Finding #1a)
+- **`ConditionExpression` is enforced.** Previously it was silently ignored, so a
+  guarded `PutItem`/`DeleteItem` would clobber data. Conditions are now evaluated
+  atomically (read-modify-write under the engine lock) and a failed condition returns
+  `ConditionalCheckFailedException`. (Finding #2)
+- **Empty-string key attributes are rejected** with `ValidationException`, matching AWS. (Finding #8)
+- **A `GetItem` miss always returns the canonical `{}`** (it could previously emit an
+  empty body when entangled with the codec bug). (Finding #9)
+
+### Added (operations)
+- **`UpdateItem`** with `UpdateExpression` (`SET`/`REMOVE`/`ADD`/`DELETE`, `+`/`-`,
+  `if_not_exists`, `list_append`), `ConditionExpression`, and `ReturnValues`. (Finding #3)
+- **`Query` `KeyConditionExpression`** (alongside legacy `KeyConditions`) with sort-key
+  operators (`<`, `<=`, `>`, `>=`, `BETWEEN`, `begins_with`), plus `FilterExpression`,
+  `ProjectionExpression`, and `ScanIndexForward`. `Scan` gains `FilterExpression` and
+  `ProjectionExpression`. (Finding #4)
+- **Batch & transactions**: `BatchWriteItem`, `BatchGetItem`, `TransactWriteItems`
+  (all-or-nothing, conditions checked before any write), `TransactGetItems`. (Finding #5)
+- **`DeleteTable`** (drops the catalog entry and purges the table's items) and a minimal
+  **`UpdateTable`**. (Finding #6)
+- **Expression engine** extended with `begins_with`, `contains`, `attribute_type`,
+  `size`, `BETWEEN`, `IN`, and numeric ordering comparisons.
+- **Opt-in SigV4 enforcement** via `CYNAMODB_REQUIRE_AUTH`: unsigned requests return
+  `MissingAuthenticationTokenException`, malformed ones `IncompleteSignatureException`.
+  (Finding #10)
+- An atomic `mutate` read-modify-write primitive and a `drop_table` purge on the
+  storage-engine interface (implemented for both the LSM and in-memory engines).
+
+### Changed
+- **Recognized-but-unimplemented operations now return `501 NotImplementedException`**
+  instead of `400 UnknownOperationException`, so SDK feature-detection can tell "not
+  built yet" from a typo'd target. Genuinely unknown targets still return
+  `UnknownOperationException`. (Finding #7)
+- `docs/api.md` and `AGENTS.md` were rewritten to match the implemented surface, with a
+  contract-tested **Implemented vs. Planned** matrix; a unit test asserts every
+  documented-Implemented op stays reachable. (Finding #11)
+
+### Tests
+- New unit suites: complex-type codec/flush round-trips, base64, the UpdateExpression
+  applier, and a broad feature suite (conditions, updates, query expressions,
+  batch/transactions, table lifecycle, error shapes). New live integration test
+  (`features_live_test.py`) exercises all of the above over real HTTP, including a
+  forced flush and auth enforcement. The full suite passes under
+  AddressSanitizer + UndefinedBehaviorSanitizer.
+
 ## [2.2.0] - 2026-06-06
 
 This release makes cynamoDB a functional local DynamoDB replacement. The previous

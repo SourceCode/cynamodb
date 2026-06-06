@@ -24,11 +24,20 @@ public:
     void put(const std::string& table_name, const std::string& key, const AttributeMap& attributes) override;
     void remove(const std::string& table_name, const std::string& key) override;
     std::optional<AttributeMap> get(const std::string& table_name, const std::string& key) override;
-    
+    MutationOutcome mutate(const std::string& table_name, const std::string& key, const Mutator& mutator) override;
+    void drop_table(const std::string& table_name) override;
+
     ScanResult scan(const std::string& table_name, const std::optional<std::string>& exclusive_start_key, size_t limit) override;
     QueryResult query(const std::string& table_name, const AttributeMap& key_conditions, const std::optional<std::string>& exclusive_start_key, size_t limit) override;
 
 private:
+    // Lock-free building blocks; the caller must already hold mutex_ exclusively.
+    // Used by the public put/remove and by mutate() so a read-modify-write can
+    // happen atomically under a single lock acquisition.
+    std::optional<AttributeMap> get_locked(const std::string& internal_key) const;
+    void put_locked(const std::string& internal_key, const AttributeMap& attributes);
+    void remove_locked(const std::string& internal_key);
+
     void flush_memtable();
     void background_compaction();
     // Merges every on-disk SSTable into a single one (newest-wins, tombstones

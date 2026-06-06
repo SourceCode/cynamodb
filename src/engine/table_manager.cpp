@@ -31,6 +31,20 @@ std::expected<core::TableDefinition, TableError> TableManager::describe_table(st
     return it->second;
 }
 
+std::expected<core::TableDefinition, TableError> TableManager::delete_table(std::string_view table_name) {
+    std::unique_lock lock(mutex_);
+    auto it = tables_.find(table_name);
+    if (it == tables_.end()) {
+        return std::unexpected(TableError::TableNotFound);
+    }
+    core::TableDefinition removed = it->second;
+    tables_.erase(it);
+    collection_sizes_.erase(std::string(table_name));
+    dirty_ = true;
+    save_metadata();
+    return removed;
+}
+
 std::vector<std::string> TableManager::list_tables() {
     std::shared_lock lock(mutex_);
     std::vector<std::string> names;

@@ -28,14 +28,33 @@ that drive the real server binary over HTTP (`crud_live_integration`,
 - **Crash recovery** (`crash_recovery_test.py`): 1500 writes + 300 deletes survive two
   `SIGKILL`s — validates WAL/SSTable/manifest durability with no graceful shutdown.
 
-**API / HTTP (unit `test_api_handlers.cpp` + live)**
-- CreateTable/DescribeTable/ListTables/PutItem/GetItem/DeleteItem/Scan/Query end-to-end.
-- Error mapping (ResourceNotFound/ResourceInUse/Validation/Serialization/UnknownOperation).
+**API / HTTP (unit `test_api_handlers.cpp`, `test_dynamo_features.cpp` + live)**
+- CreateTable/DescribeTable/ListTables/DeleteTable/UpdateTable end-to-end.
+- PutItem/GetItem/UpdateItem/DeleteItem/Scan/Query end-to-end, incl.
+  `ConditionExpression`, `UpdateExpression`, `ReturnValues`.
+- Query `KeyConditionExpression` + sort-key operators (`<`/`<=`/`>`/`>=`/`BETWEEN`/
+  `begins_with`), `FilterExpression`, `ProjectionExpression`, `ScanIndexForward`.
+- Batch & transactions: `BatchWriteItem`/`BatchGetItem`/`TransactWriteItems`
+  (all-or-nothing)/`TransactGetItems`.
+- Error mapping (ResourceNotFound/ResourceInUse/Validation/Serialization/
+  ConditionalCheckFailed/TransactionCanceled/NotImplemented(501)/UnknownOperation).
+- **Docs contract** (`[contract]`): every operation documented as Implemented in
+  `docs/api.md` is asserted reachable (never 501/UnknownOperation).
 - **Robustness** (`[robustness]`): missing fields, wrong key types, oversized items
-  (>400KB), unrecognized attribute types, malformed/empty JSON, missing TableName.
+  (>400KB), unrecognized attribute types, malformed/empty JSON, missing TableName,
+  empty-string key attributes.
 - **Live CRUD over HTTP across 3 restarts** (`crud_live_test.py`, 1586 assertions).
+- **Live feature suite** (`features_live_test.py`): complex types surviving a real
+  memtable→SSTable flush, conditional writes, UpdateItem, query expressions,
+  batch/transactions, table lifecycle, error shapes, and SigV4 enforcement.
 - **Concurrent load** (`concurrent_load_test.py`): 4000 records via 8 parallel clients,
   consistency verified (no lost/duplicated/corrupted items).
+
+**Complex types & codecs (`test_complex_types.cpp`, `test_update_expression.cpp`)**
+- SSTable codec round-trips M/L/SS/NS/BS/B (the whole row survives a flush).
+- LsmEngine end-to-end: a map survives writing >1000 rows (forces a flush).
+- JSON wire codec round-trips L/SS/NS/BS/B without degrading to `{"NULL":true}`;
+  base64 encode/decode (incl. malformed rejection); UpdateExpression applier.
 
 **Sanitizers**: full unit suite + live tests pass under AddressSanitizer +
 UndefinedBehaviorSanitizer (`-fno-sanitize-recover=all`).
@@ -51,31 +70,41 @@ UndefinedBehaviorSanitizer (`-fno-sanitize-recover=all`).
   (add a sequential `SSTable::load_all`), it holds the engine lock for the whole merge
   (acceptable at current scale), and the strategy is full-merge rather than leveled.
 
+## Addressed in v2.3.0 (from CYNAMODB_FINDINGS.md)
+
+- **Full attribute-type fidelity** — DONE. `B`/`BS` base64 decode/encode; `L`/`SS`/`NS`/
+  `BS`/`B` serialize correctly; the SSTable codec shares the WAL's full-fidelity format
+  so every type survives a flush. Round-trip + write→flush→read tests added.
+- **Query expressiveness** — DONE. `KeyConditionExpression`, sort-key range conditions,
+  `FilterExpression`, `ProjectionExpression`, `ScanIndexForward`, with tests.
+- **Conditional writes & UpdateItem** — DONE. `ConditionExpression` (atomic via the
+  engine `mutate` primitive), `UpdateItem` with update expressions, and `ReturnValues`.
+- **Transactions** — DONE (best-effort). `TransactWriteItems` verifies all conditions
+  before applying any write (all-or-nothing for the no-concurrent-writer case);
+  `TransactGetItems` reads. Strict cross-key isolation under contention is future work.
+- **Auth** — DONE. `CYNAMODB_REQUIRE_AUTH` enforces SigV4 header presence/shape
+  (cryptographic signature verification remains future work).
+- **501 vs UnknownOperation** and **empty-key rejection** — DONE, with tests.
+
 ## Remaining gaps to close before production (recommended, prioritized)
 
-These are **not yet built**; they reflect known partial implementations (see
-ITEMS_TO_FIX.md §G) and deeper validation that a production deployment warrants.
+These are **not yet built**; they reflect known partial implementations and deeper
+validation that a production deployment warrants.
 
-1. **Full attribute-type fidelity.** Binary (`B`) is not base64-decoded; `L`/`SS`/`NS`/
-   `BS`/`B` are not serialized in responses; the SSTable codec only persists S/N/BOOL
-   (complex types are lost on flush). Finish the codecs and add round-trip tests
-   (including a value that is written, flushed, and read back).
-2. **Query expressiveness.** Only legacy `KeyConditions` EQ is supported. Add
-   `KeyConditionExpression`, sort-key range conditions (`<`, `between`, `begins_with`),
-   `FilterExpression`, projection, and `ScanIndexForward`, with tests.
-3. **Conditional writes & UpdateItem.** `ConditionExpression`, `UpdateItem` with
-   update expressions, and `ReturnValues` are absent; add them with conflict tests.
-4. **Transactions.** `TransactWriteItems` OCC is mocked (no real isolation/atomicity);
-   add atomicity-under-conflict and all-or-nothing rollback tests.
-5. **Secondary indexes (GSI/LSI).** Replication/projection are placeholders; add
-   end-to-end index query tests once implemented.
-6. **Auth.** SigV4 is parsed but not enforced; add an auth-required mode + tests.
-7. **Capacity throttling** is implemented but not wired into the request path; wire it
+1. **Secondary indexes (GSI/LSI).** Definitions are accepted but `IndexName` queries are
+   not honored; add replication/projection and end-to-end index query tests.
+2. **Document-path expressions.** `ProjectionExpression`/`UpdateExpression` operate on
+   top-level attributes only; add nested-path (`a.b`, `a[0]`) support.
+3. **Streams / TTL / backups / PITR / global tables / PartiQL.** Recognized but return
+   `501 NotImplementedException`; implement and test as needed.
+4. **SigV4 signature verification.** Enforcement checks presence/shape only; add a
+   credential store and full canonical-request signature comparison.
+5. **Capacity throttling** is implemented but not wired into the request path; wire it
    and test 4xx throttling responses.
-8. **Soak / leak test.** A long-running mixed-workload test (hours) watching RSS to
+6. **Soak / leak test.** A long-running mixed-workload test (hours) watching RSS to
    catch slow leaks and fragmentation under sustained flush/compaction.
-9. **Fuzzing in CI.** Fuzz targets exist (`fuzz_json`, `fuzz_expressions`, `fuzz_sigv4`)
+7. **Fuzzing in CI.** Fuzz targets exist (`fuzz_json`, `fuzz_expressions`, `fuzz_sigv4`)
    but are not run regularly; wire them into a scheduled fuzzing job.
-10. **Boundary/encoding tests.** Empty strings, very large numbers (beyond 2^53 — the
-    key codec uses double, see ITEMS_TO_FIX §G), unicode keys, max attribute-name
-    length, and duplicate-attribute handling.
+8. **Boundary/encoding tests.** Very large numbers (beyond 2^53 — the key codec uses
+   double, see ITEMS_TO_FIX §G), unicode keys, max attribute-name length, and
+   duplicate-attribute handling.

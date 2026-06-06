@@ -222,6 +222,17 @@ std::string encode_attributes(const RecordAttributes& attrs) {
     return out;
 }
 
+std::string encode_attribute_value(const AttributeValue& av) {
+    std::string out;
+    encode_value(out, av);
+    return out;
+}
+
+std::shared_ptr<AttributeValue> decode_attribute_value(std::string_view data) {
+    Reader r{data, 0};
+    return decode_value(r);
+}
+
 std::optional<RecordAttributes> decode_attributes(std::string_view data) {
     Reader r{data, 0};
     uint32_t count = 0;

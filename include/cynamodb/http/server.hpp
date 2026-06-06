@@ -5,9 +5,11 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/strand.hpp>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 #include <cynamodb/context.hpp>
+#include <cynamodb/api/handlers.hpp>
 
 namespace cynamodb::http {
 
@@ -44,6 +46,9 @@ private:
     void do_read();
     void on_read(beast::error_code ec, std::size_t bytes_transferred);
     void handle_request();
+    // Returns an error result when CYNAMODB_REQUIRE_AUTH is on and the request
+    // lacks a parseable SigV4 Authorization header; nullopt means allow.
+    std::optional<api::ApiResult> check_auth();
     void do_write(http::response<http::string_body> res);
     void on_write(beast::error_code ec, std::size_t bytes_transferred, bool close);
 
