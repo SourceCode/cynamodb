@@ -34,6 +34,11 @@ private:
     std::expected<std::shared_ptr<ASTNode>, ParserError> parse_not(size_t depth);
     std::expected<std::shared_ptr<ASTNode>, ParserError> parse_comparison(size_t depth);
     std::expected<std::shared_ptr<ASTNode>, ParserError> parse_primary(size_t depth);
+    std::expected<std::shared_ptr<ASTNode>, ParserError> parse_path(PathSegment root, size_t depth);
 };
+
+// Parses a standalone document path (e.g. "a.b[0].c", "#x.#y"). Returns nullopt if
+// the string is not a single valid path. Used by ProjectionExpression handling.
+std::optional<PathNode> parse_single_path(const std::string& text);
 
 } // namespace cynamodb::expressions

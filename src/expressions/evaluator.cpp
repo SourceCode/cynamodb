@@ -63,6 +63,53 @@ std::shared_ptr<core::AttributeValue> make_number(long double n) {
     return av;
 }
 
+using ItemMap = std::map<std::string, std::shared_ptr<core::AttributeValue>, core::StringViewLess>;
+using NameMap = std::map<std::string, std::string, core::StringViewLess>;
+
+// Resolves a path segment's name, dereferencing a leading '#' via ExpressionAttributeNames.
+std::optional<std::string> resolve_segment_name(const std::string& raw, const NameMap& names) {
+    if (raw.starts_with("#")) {
+        auto it = names.find(raw);
+        if (it == names.end() || !is_valid_identifier(it->second)) return std::nullopt;
+        return it->second;
+    }
+    return raw;
+}
+
+// Walks a document path (a, a.b.c, a[0].b, #a.#b[2]) into the item, descending
+// into maps for Name steps and lists for Index steps. Returns nullptr if any step
+// does not resolve (missing key, out-of-range index, type mismatch).
+std::shared_ptr<core::AttributeValue> navigate_path(const PathNode& path, const ItemMap& item,
+                                                   const NameMap& names) {
+    if (path.segments.empty()) return nullptr;
+    const auto& root = path.segments.front();
+    if (root.kind != PathSegment::Kind::Name) return nullptr;
+    auto root_name = resolve_segment_name(root.name, names);
+    if (!root_name) return nullptr;
+    auto it = item.find(*root_name);
+    if (it == item.end()) return nullptr;
+    std::shared_ptr<core::AttributeValue> current = it->second;
+
+    for (size_t i = 1; i < path.segments.size() && current; ++i) {
+        const auto& seg = path.segments[i];
+        if (seg.kind == PathSegment::Kind::Name) {
+            if (current->type != core::AttributeType::M) return nullptr;
+            auto name = resolve_segment_name(seg.name, names);
+            if (!name) return nullptr;
+            const auto& m = std::get<core::MapValue>(current->value);
+            auto mit = m.find(core::String(*name));
+            if (mit == m.end()) return nullptr;
+            current = mit->second;
+        } else {  // Index
+            if (current->type != core::AttributeType::L) return nullptr;
+            const auto& l = std::get<core::ListValue>(current->value);
+            if (seg.index >= l.size()) return nullptr;
+            current = l[seg.index];
+        }
+    }
+    return current;
+}
+
 std::string type_code(core::AttributeType t) {
     switch (t) {
         case core::AttributeType::S: return "S";
@@ -182,8 +229,8 @@ bool Evaluator::evaluate_condition_impl(
         }
 
         if ((fn == "ATTRIBUTE_EXISTS" || fn == "ATTRIBUTE_NOT_EXISTS") && func.arguments.size() == 1) {
-            auto attr_name = get_attribute_name(*func.arguments[0], names);
-            bool exists = attr_name && item.find(*attr_name) != item.end();
+            // Path-aware: a value resolves iff the (possibly nested) attribute exists.
+            bool exists = evaluate_expression(*func.arguments[0], item, names, values) != nullptr;
             return (fn == "ATTRIBUTE_EXISTS") ? exists : !exists;
         }
 
@@ -282,6 +329,10 @@ std::shared_ptr<core::AttributeValue> Evaluator::evaluate_expression(
         return nullptr;
     }
 
+    if (std::holds_alternative<PathNode>(node.data)) {
+        return navigate_path(std::get<PathNode>(node.data), item, names);
+    }
+
     if (std::holds_alternative<IdentifierNode>(node.data)) {
         const auto& id = std::get<IdentifierNode>(node.data);
         auto it = item.find(id.name);
@@ -310,9 +361,23 @@ std::shared_ptr<core::AttributeValue> Evaluator::evaluate_expression(
     return nullptr;
 }
 
+std::shared_ptr<core::AttributeValue> Evaluator::resolve_path(
+    const PathNode& path,
+    const std::map<std::string, std::shared_ptr<core::AttributeValue>, core::StringViewLess>& item,
+    const std::map<std::string, std::string, core::StringViewLess>& names) {
+    return navigate_path(path, item, names);
+}
+
 std::optional<std::string> Evaluator::get_attribute_name(
     const ASTNode& node,
     const std::map<std::string, std::string, core::StringViewLess>& names) {
+    if (std::holds_alternative<PathNode>(node.data)) {
+        const auto& p = std::get<PathNode>(node.data);
+        if (p.segments.size() == 1 && p.segments[0].kind == PathSegment::Kind::Name) {
+            return resolve_segment_name(p.segments[0].name, names);
+        }
+        return std::nullopt;
+    }
     if (std::holds_alternative<IdentifierNode>(node.data)) {
         return std::get<IdentifierNode>(node.data).name;
     }

@@ -15,14 +15,16 @@ using core::AttributeType;
 using core::AttributeValue;
 
 // ---- Tokenizer ----------------------------------------------------------
-// The shared expression Lexer does not emit '+' / '-', which UpdateExpressions
-// need, so update expressions get their own small, self-contained tokenizer.
+// The shared expression Lexer does not emit '+'/'-', and UpdateExpressions need
+// them, so update expressions get their own small tokenizer. It also emits Dot
+// and Index tokens for document paths (a.b, a[0]).
 
-enum class TT { Ident, Name, Value, Op, LParen, RParen, Comma, Keyword, End, Bad };
+enum class TT { Ident, Name, Value, Op, LParen, RParen, Comma, Dot, Index, Keyword, End, Bad };
 
 struct Tok {
     TT type;
     std::string text;
+    size_t index = 0;  // for TT::Index
 };
 
 bool ident_start(unsigned char c) { return std::isalpha(c) != 0 || c == '_'; }
@@ -50,33 +52,37 @@ std::vector<Tok> tokenize(const std::string& in, bool& bad) {
             size_t start = i++;
             if (i >= in.size() || !ident_start(static_cast<unsigned char>(in[i]))) { bad = true; break; }
             while (i < in.size() && ident_char(static_cast<unsigned char>(in[i]))) ++i;
-            out.push_back({TT::Name, in.substr(start, i - start)});
+            out.push_back({TT::Name, in.substr(start, i - start), 0});
         } else if (c == ':') {
             size_t start = i++;
             if (i >= in.size() || !ident_start(static_cast<unsigned char>(in[i]))) { bad = true; break; }
             while (i < in.size() && ident_char(static_cast<unsigned char>(in[i]))) ++i;
-            out.push_back({TT::Value, in.substr(start, i - start)});
+            out.push_back({TT::Value, in.substr(start, i - start), 0});
         } else if (ident_start(static_cast<unsigned char>(c))) {
             size_t start = i;
             while (i < in.size() && (ident_char(static_cast<unsigned char>(in[i])))) ++i;
             std::string word = in.substr(start, i - start);
-            if (is_section_keyword(upper(word))) {
-                out.push_back({TT::Keyword, upper(word)});
-            } else {
-                out.push_back({TT::Ident, word});
-            }
+            if (is_section_keyword(upper(word))) out.push_back({TT::Keyword, upper(word), 0});
+            else out.push_back({TT::Ident, word, 0});
         } else if (c == '=' || c == '+' || c == '-') {
-            out.push_back({TT::Op, std::string(1, c)});
+            out.push_back({TT::Op, std::string(1, c), 0});
             ++i;
-        } else if (c == '(') { out.push_back({TT::LParen, "("}); ++i; }
-        else if (c == ')') { out.push_back({TT::RParen, ")"}); ++i; }
-        else if (c == ',') { out.push_back({TT::Comma, ","}); ++i; }
-        else if (c == '.' || c == '[' || c == ']') {
-            // Document paths / list indexes are not yet supported.
-            bad = true; break;
+        } else if (c == '(') { out.push_back({TT::LParen, "(", 0}); ++i; }
+        else if (c == ')') { out.push_back({TT::RParen, ")", 0}); ++i; }
+        else if (c == ',') { out.push_back({TT::Comma, ",", 0}); ++i; }
+        else if (c == '.') { out.push_back({TT::Dot, ".", 0}); ++i; }
+        else if (c == '[') {
+            size_t start = ++i;
+            while (i < in.size() && std::isdigit(static_cast<unsigned char>(in[i])) != 0) ++i;
+            if (i == start || i >= in.size() || in[i] != ']') { bad = true; break; }
+            std::string digits = in.substr(start, i - start);
+            ++i;  // consume ']'
+            size_t idx = 0;
+            try { idx = static_cast<size_t>(std::stoul(digits)); } catch (...) { bad = true; break; }
+            out.push_back({TT::Index, "", idx});
         } else { bad = true; break; }
     }
-    out.push_back({TT::End, ""});
+    out.push_back({TT::End, "", 0});
     return out;
 }
 
@@ -104,6 +110,38 @@ std::shared_ptr<AttributeValue> make_number(long double n) {
     return av;
 }
 
+// Deep-copies an attribute value so a nested mutation never aliases the value
+// objects shared with the stored item (working maps copy the shared_ptrs, not
+// the pointees).
+std::shared_ptr<AttributeValue> deep_clone(const std::shared_ptr<AttributeValue>& v) {
+    if (!v) return nullptr;
+    auto out = std::make_shared<AttributeValue>();
+    out->type = v->type;
+    switch (v->type) {
+        case AttributeType::M: {
+            core::MapValue m;
+            for (const auto& [k, child] : std::get<core::MapValue>(v->value)) m[k] = deep_clone(child);
+            out->value = std::move(m);
+            break;
+        }
+        case AttributeType::L: {
+            core::ListValue l;
+            for (const auto& child : std::get<core::ListValue>(v->value)) l.push_back(deep_clone(child));
+            out->value = std::move(l);
+            break;
+        }
+        default:
+            out->value = v->value;  // scalars and sets are value types
+            break;
+    }
+    return out;
+}
+
+// ---- Document path ------------------------------------------------------
+
+struct Seg { bool is_index = false; std::string name; size_t index = 0; };
+using Path = std::vector<Seg>;
+
 // ---- Parser / evaluator -------------------------------------------------
 
 struct Applier {
@@ -122,18 +160,39 @@ struct Applier {
         return false;
     }
 
-    // Resolves a path token (Ident or #Name) to a top-level attribute name.
-    std::optional<std::string> resolve_path() {
-        const Tok& t = peek();
-        if (t.type == TT::Ident) { advance(); return t.text; }
-        if (t.type == TT::Name) {
-            advance();
-            auto it = names.find(t.text);
-            if (it == names.end()) { fail("ExpressionAttributeNames missing entry for " + t.text); return std::nullopt; }
+    std::optional<std::string> resolve_name(const std::string& raw) {
+        if (raw.starts_with("#")) {
+            auto it = names.find(raw);
+            if (it == names.end()) { fail("ExpressionAttributeNames missing entry for " + raw); return std::nullopt; }
             return it->second;
         }
-        fail("Expected an attribute path in UpdateExpression");
-        return std::nullopt;
+        return raw;
+    }
+
+    // Parses a document path: root (Ident|#Name) followed by .name / [index] steps.
+    std::optional<Path> parse_path() {
+        const Tok& t = peek();
+        if (t.type != TT::Ident && t.type != TT::Name) { fail("Expected an attribute path"); return std::nullopt; }
+        advance();
+        auto root = resolve_name(t.text);
+        if (!root) return std::nullopt;
+        Path p;
+        p.push_back({false, *root, 0});
+        while (peek().type == TT::Dot || peek().type == TT::Index) {
+            if (peek().type == TT::Dot) {
+                advance();
+                const Tok& seg = peek();
+                if (seg.type != TT::Ident && seg.type != TT::Name) { fail("Expected a name after '.'"); return std::nullopt; }
+                advance();
+                auto n = resolve_name(seg.text);
+                if (!n) return std::nullopt;
+                p.push_back({false, *n, 0});
+            } else {
+                size_t idx = advance().index;
+                p.push_back({true, "", idx});
+            }
+        }
+        return p;
     }
 
     std::shared_ptr<AttributeValue> resolve_value_ref() {
@@ -145,6 +204,104 @@ struct Applier {
         return it->second;
     }
 
+    // Reads the current value at a path (nullptr if absent).
+    std::shared_ptr<AttributeValue> read_path(const Path& p) {
+        if (p.empty() || p[0].is_index) return nullptr;
+        auto it = item.find(p[0].name);
+        if (it == item.end()) return nullptr;
+        std::shared_ptr<AttributeValue> cur = it->second;
+        for (size_t i = 1; i < p.size() && cur; ++i) {
+            const auto& s = p[i];
+            if (s.is_index) {
+                if (cur->type != AttributeType::L) return nullptr;
+                const auto& l = std::get<core::ListValue>(cur->value);
+                if (s.index >= l.size()) return nullptr;
+                cur = l[s.index];
+            } else {
+                if (cur->type != AttributeType::M) return nullptr;
+                const auto& m = std::get<core::MapValue>(cur->value);
+                auto mit = m.find(core::String(s.name));
+                if (mit == m.end()) return nullptr;
+                cur = mit->second;
+            }
+        }
+        return cur;
+    }
+
+    // Writes `value` at a path (set). Parents must already exist; a list index may
+    // equal the list size (append). Uses copy-on-write on the root attribute.
+    bool write_path(const Path& p, const std::shared_ptr<AttributeValue>& value) {
+        if (p.empty() || p[0].is_index) return fail("Invalid update path");
+        if (p.size() == 1) { item[p[0].name] = value; return true; }
+
+        auto it = item.find(p[0].name);
+        if (it == item.end() || !it->second) return fail("Update path parent does not exist");
+        auto root = deep_clone(it->second);
+        AttributeValue* cur = root.get();
+        for (size_t i = 1; i + 1 < p.size(); ++i) {  // navigate to the parent of the leaf
+            const auto& s = p[i];
+            if (s.is_index) {
+                if (cur->type != AttributeType::L) return fail("Update path is not a list");
+                auto& l = std::get<core::ListValue>(cur->value);
+                if (s.index >= l.size() || !l[s.index]) return fail("Update path index out of range");
+                cur = l[s.index].get();
+            } else {
+                if (cur->type != AttributeType::M) return fail("Update path is not a map");
+                auto& m = std::get<core::MapValue>(cur->value);
+                auto mit = m.find(core::String(s.name));
+                if (mit == m.end() || !mit->second) return fail("Update path parent does not exist");
+                cur = mit->second.get();
+            }
+        }
+        const auto& leaf = p.back();
+        if (leaf.is_index) {
+            if (cur->type != AttributeType::L) return fail("Update path is not a list");
+            auto& l = std::get<core::ListValue>(cur->value);
+            if (leaf.index < l.size()) l[leaf.index] = value;
+            else if (leaf.index == l.size()) l.push_back(value);
+            else return fail("Update list index out of range");
+        } else {
+            if (cur->type != AttributeType::M) return fail("Update path is not a map");
+            std::get<core::MapValue>(cur->value)[core::String(leaf.name)] = value;
+        }
+        item[p[0].name] = root;
+        return true;
+    }
+
+    bool erase_path(const Path& p) {
+        if (p.empty() || p[0].is_index) return true;
+        if (p.size() == 1) { item.erase(p[0].name); return true; }
+        auto it = item.find(p[0].name);
+        if (it == item.end() || !it->second) return true;  // nothing to remove
+        auto root = deep_clone(it->second);
+        AttributeValue* cur = root.get();
+        for (size_t i = 1; i + 1 < p.size(); ++i) {
+            const auto& s = p[i];
+            if (s.is_index) {
+                if (cur->type != AttributeType::L) return true;
+                auto& l = std::get<core::ListValue>(cur->value);
+                if (s.index >= l.size() || !l[s.index]) return true;
+                cur = l[s.index].get();
+            } else {
+                if (cur->type != AttributeType::M) return true;
+                auto& m = std::get<core::MapValue>(cur->value);
+                auto mit = m.find(core::String(s.name));
+                if (mit == m.end() || !mit->second) return true;
+                cur = mit->second.get();
+            }
+        }
+        const auto& leaf = p.back();
+        if (leaf.is_index) {
+            if (cur->type != AttributeType::L) return true;
+            auto& l = std::get<core::ListValue>(cur->value);
+            if (leaf.index < l.size()) l.erase(l.begin() + static_cast<long>(leaf.index));
+        } else {
+            if (cur->type == AttributeType::M) std::get<core::MapValue>(cur->value).erase(core::String(leaf.name));
+        }
+        item[p[0].name] = root;
+        return true;
+    }
+
     // operand := value | path | if_not_exists(path, operand) | list_append(operand, operand)
     std::shared_ptr<AttributeValue> parse_operand() {
         const Tok& t = peek();
@@ -152,22 +309,19 @@ struct Applier {
         if (t.type == TT::Ident) {
             std::string lname = upper(t.text);
             if (lname == "IF_NOT_EXISTS" && toks[pos + 1].type == TT::LParen) {
-                advance();  // function name
-                advance();  // (
-                auto path = resolve_path();
+                advance(); advance();  // name + '('
+                auto path = parse_path();
                 if (!path) return nullptr;
                 if (peek().type != TT::Comma) { fail("if_not_exists expects two arguments"); return nullptr; }
                 advance();
                 auto fallback = parse_additive();
                 if (peek().type != TT::RParen) { fail("if_not_exists missing )"); return nullptr; }
                 advance();
-                auto existing = item.find(*path);
-                if (existing != item.end() && existing->second) return existing->second;
-                return fallback;
+                auto existing = read_path(*path);
+                return existing ? existing : fallback;
             }
             if (lname == "LIST_APPEND" && toks[pos + 1].type == TT::LParen) {
-                advance();  // function name
-                advance();  // (
+                advance(); advance();  // name + '('
                 auto a = parse_additive();
                 if (peek().type != TT::Comma) { fail("list_append expects two arguments"); return nullptr; }
                 advance();
@@ -185,25 +339,19 @@ struct Applier {
                 result->value = std::move(merged);
                 return result;
             }
-            // Plain path operand.
-            auto path = resolve_path();
+            auto path = parse_path();
             if (!path) return nullptr;
-            auto existing = item.find(*path);
-            if (existing != item.end()) return existing->second;
-            return nullptr;  // missing operand
+            return read_path(*path);
         }
         if (t.type == TT::Name) {
-            auto path = resolve_path();
+            auto path = parse_path();
             if (!path) return nullptr;
-            auto existing = item.find(*path);
-            if (existing != item.end()) return existing->second;
-            return nullptr;
+            return read_path(*path);
         }
         fail("Unexpected token in UpdateExpression operand");
         return nullptr;
     }
 
-    // additive := operand (('+'|'-') operand)*
     std::shared_ptr<AttributeValue> parse_additive() {
         auto left = parse_operand();
         while (peek().type == TT::Op && (peek().text == "+" || peek().text == "-")) {
@@ -213,8 +361,7 @@ struct Applier {
                 fail("Arithmetic in SET requires numeric operands");
                 return nullptr;
             }
-            long double l = 0;
-            long double r = 0;
+            long double l = 0, r = 0;
             if (!parse_num(std::get<core::String>(left->value), l) ||
                 !parse_num(std::get<core::String>(right->value), r)) {
                 fail("Invalid number in SET arithmetic");
@@ -227,14 +374,14 @@ struct Applier {
 
     bool do_set() {
         while (true) {
-            auto target = resolve_path();
+            auto target = parse_path();
             if (!target) return false;
             if (!(peek().type == TT::Op && peek().text == "=")) return fail("SET clause expects '='");
             advance();
             auto value = parse_additive();
             if (!error.empty()) return false;
             if (!value) return fail("SET value resolves to nothing");
-            item[*target] = value;
+            if (!write_path(*target, value)) return false;
             if (peek().type == TT::Comma) { advance(); continue; }
             break;
         }
@@ -243,9 +390,9 @@ struct Applier {
 
     bool do_remove() {
         while (true) {
-            auto target = resolve_path();
+            auto target = parse_path();
             if (!target) return false;
-            item.erase(*target);
+            if (!erase_path(*target)) return false;
             if (peek().type == TT::Comma) { advance(); continue; }
             break;
         }
@@ -254,37 +401,32 @@ struct Applier {
 
     bool do_add() {
         while (true) {
-            auto target = resolve_path();
+            auto target = parse_path();
             if (!target) return false;
             auto operand = resolve_value_ref();
             if (!operand) return false;
-            auto existing = item.find(*target);
+            auto existing = read_path(*target);
             if (operand->type == AttributeType::N) {
                 long double delta = 0;
                 if (!parse_num(std::get<core::String>(operand->value), delta)) return fail("ADD value is not a number");
                 long double base = 0;
-                if (existing != item.end() && existing->second && existing->second->type == AttributeType::N) {
-                    parse_num(std::get<core::String>(existing->second->value), base);
-                }
-                item[*target] = make_number(base + delta);
+                if (existing && existing->type == AttributeType::N) parse_num(std::get<core::String>(existing->value), base);
+                if (!write_path(*target, make_number(base + delta))) return false;
             } else if (operand->type == AttributeType::SS || operand->type == AttributeType::NS) {
-                // Union into an existing set of the same type (or create it).
-                if (existing == item.end() || !existing->second) {
-                    item[*target] = operand;
-                } else if (existing->second->type == operand->type) {
-                    auto merged = std::make_shared<AttributeValue>(*existing->second);
+                if (!existing) {
+                    if (!write_path(*target, operand)) return false;
+                } else if (existing->type == operand->type) {
+                    auto merged = std::make_shared<AttributeValue>(*existing);
                     if (operand->type == AttributeType::SS) {
                         auto& dst = std::get<core::StringSet>(merged->value).values;
-                        for (const auto& v : std::get<core::StringSet>(operand->value).values) {
+                        for (const auto& v : std::get<core::StringSet>(operand->value).values)
                             if (std::find(dst.begin(), dst.end(), v) == dst.end()) dst.push_back(v);
-                        }
                     } else {
                         auto& dst = std::get<core::NumberSet>(merged->value).values;
-                        for (const auto& v : std::get<core::NumberSet>(operand->value).values) {
+                        for (const auto& v : std::get<core::NumberSet>(operand->value).values)
                             if (std::find(dst.begin(), dst.end(), v) == dst.end()) dst.push_back(v);
-                        }
                     }
-                    item[*target] = merged;
+                    if (!write_path(*target, merged)) return false;
                 } else {
                     return fail("ADD set type does not match existing attribute");
                 }
@@ -299,32 +441,34 @@ struct Applier {
 
     bool do_delete() {
         while (true) {
-            auto target = resolve_path();
+            auto target = parse_path();
             if (!target) return false;
             auto operand = resolve_value_ref();
             if (!operand) return false;
-            auto existing = item.find(*target);
-            if (existing != item.end() && existing->second &&
-                existing->second->type == operand->type &&
+            auto existing = read_path(*target);
+            if (existing && existing->type == operand->type &&
                 (operand->type == AttributeType::SS || operand->type == AttributeType::NS)) {
-                auto result = std::make_shared<AttributeValue>(*existing->second);
+                auto result = std::make_shared<AttributeValue>(*existing);
+                bool empty = false;
                 if (operand->type == AttributeType::SS) {
                     auto& dst = std::get<core::StringSet>(result->value).values;
                     const auto& rm = std::get<core::StringSet>(operand->value).values;
                     dst.erase(std::remove_if(dst.begin(), dst.end(), [&](const core::String& s) {
                                   return std::find(rm.begin(), rm.end(), s) != rm.end();
                               }), dst.end());
-                    if (dst.empty()) item.erase(*target); else item[*target] = result;
+                    empty = dst.empty();
                 } else {
                     auto& dst = std::get<core::NumberSet>(result->value).values;
                     const auto& rm = std::get<core::NumberSet>(operand->value).values;
                     dst.erase(std::remove_if(dst.begin(), dst.end(), [&](const core::String& s) {
                                   return std::find(rm.begin(), rm.end(), s) != rm.end();
                               }), dst.end());
-                    if (dst.empty()) item.erase(*target); else item[*target] = result;
+                    empty = dst.empty();
                 }
+                if (empty) { if (!erase_path(*target)) return false; }
+                else { if (!write_path(*target, result)) return false; }
             }
-            // DELETE on a missing/typed-mismatched attribute is a no-op in AWS.
+            // DELETE on a missing / type-mismatched attribute is a no-op in AWS.
             if (peek().type == TT::Comma) { advance(); continue; }
             break;
         }
@@ -354,8 +498,7 @@ UpdateResult apply_update_expression(const std::string& expression, ItemMap& ite
     bool bad = false;
     auto toks = tokenize(expression, bad);
     if (bad) return {false, "Invalid UpdateExpression syntax"};
-    // Operate on a copy so a mid-expression failure leaves the item untouched.
-    ItemMap working = item;
+    ItemMap working = item;  // operate on a copy so a mid-expression failure is atomic
     Applier ap{toks, 0, working, names, values, {}};
     if (!ap.run()) return {false, ap.error.empty() ? "Invalid UpdateExpression" : ap.error};
     item = std::move(working);

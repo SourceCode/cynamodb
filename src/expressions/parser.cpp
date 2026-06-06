@@ -1,5 +1,6 @@
 #include <cynamodb/expressions/parser.hpp>
 #include <algorithm>
+#include <stdexcept>
 
 namespace cynamodb::expressions {
 
@@ -284,12 +285,18 @@ std::expected<std::shared_ptr<ASTNode>, ParserError> Parser::parse_primary(size_
             node->data = FunctionCallNode{token.value, std::move(args)};
             return node;
         }
-        auto node = std::make_unique<ASTNode>();
-        node->data = IdentifierNode{token.value};
-        return node;
+        // A document path rooted at this identifier (single segment for a plain name).
+        return parse_path(PathSegment{PathSegment::Kind::Name, token.value, 0}, depth);
     }
 
-    if (token.type == TokenType::PLACEHOLDER_NAME || token.type == TokenType::PLACEHOLDER_VALUE) {
+    if (token.type == TokenType::PLACEHOLDER_NAME) {
+        if (token.value.size() > kMaxIdentifierBytes || token.value.size() < 2) {
+            return std::unexpected(ParserError::InvalidExpression);
+        }
+        return parse_path(PathSegment{PathSegment::Kind::Name, token.value, 0}, depth);
+    }
+
+    if (token.type == TokenType::PLACEHOLDER_VALUE) {
         if (token.value.size() > kMaxIdentifierBytes || token.value.size() < 2) {
             return std::unexpected(ParserError::InvalidExpression);
         }
@@ -299,6 +306,52 @@ std::expected<std::shared_ptr<ASTNode>, ParserError> Parser::parse_primary(size_
     }
 
     return std::unexpected(ParserError::UnexpectedToken);
+}
+
+std::expected<std::shared_ptr<ASTNode>, ParserError> Parser::parse_path(PathSegment root, size_t /*depth*/) {
+    PathNode path;
+    path.segments.push_back(std::move(root));
+    while (peek().type == TokenType::DOT || peek().type == TokenType::INDEX) {
+        if (path.segments.size() > kMaxParserDepth) {
+            return std::unexpected(ParserError::InvalidExpression);
+        }
+        if (peek().type == TokenType::DOT) {
+            consume();
+            auto seg = consume();
+            if (seg.type == TokenType::IDENTIFIER || seg.type == TokenType::KEYWORD ||
+                seg.type == TokenType::PLACEHOLDER_NAME) {
+                if (seg.value.empty() || seg.value.size() > kMaxIdentifierBytes) {
+                    return std::unexpected(ParserError::InvalidExpression);
+                }
+                path.segments.push_back(PathSegment{PathSegment::Kind::Name, seg.value, 0});
+            } else {
+                return std::unexpected(ParserError::ExpectedIdentifier);
+            }
+        } else {  // INDEX
+            auto seg = consume();
+            size_t idx = 0;
+            try {
+                idx = static_cast<size_t>(std::stoul(seg.value));
+            } catch (const std::exception&) {
+                return std::unexpected(ParserError::InvalidExpression);
+            }
+            path.segments.push_back(PathSegment{PathSegment::Kind::Index, "", idx});
+        }
+    }
+    auto node = std::make_unique<ASTNode>();
+    node->data = std::move(path);
+    return node;
+}
+
+std::optional<PathNode> parse_single_path(const std::string& text) {
+    Lexer lexer(text);
+    Parser parser(lexer.tokenize());
+    auto res = parser.parse_expression();
+    if (!res || !*res) return std::nullopt;
+    if (std::holds_alternative<PathNode>((*res)->data)) {
+        return std::get<PathNode>((*res)->data);
+    }
+    return std::nullopt;
 }
 
 } // namespace cynamodb::expressions

@@ -130,6 +130,17 @@ Token Lexer::next_token() {
     if (c == ')') { pos_++; return {TokenType::CLOSE_PAREN, ")"}; }
     if (c == ',') { pos_++; return {TokenType::COMMA, ","}; }
     if (c == '.') { pos_++; return {TokenType::DOT, "."}; }
+    if (c == '[') {
+        size_t start = ++pos_;
+        while (pos_ < input_.size() && std::isdigit(static_cast<unsigned char>(input_[pos_])) != 0) pos_++;
+        if (pos_ == start || pos_ >= input_.size() || input_[pos_] != ']') {
+            return {TokenType::INVALID, "["};
+        }
+        std::string digits = input_.substr(start, pos_ - start);
+        pos_++;  // consume ']'
+        if (digits.size() > 9) return {TokenType::INVALID, "index-too-large"};
+        return {TokenType::INDEX, digits};
+    }
 
     const char bad = input_[pos_++];
     return {TokenType::INVALID, std::string(1, bad)};

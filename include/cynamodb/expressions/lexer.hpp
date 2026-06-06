@@ -16,6 +16,7 @@ enum class TokenType {
     CLOSE_PAREN,
     COMMA,
     DOT,
+    INDEX,              // [123] list-index step in a document path; value holds the digits
     INVALID,
     END_OF_FILE
 };

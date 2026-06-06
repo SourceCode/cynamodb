@@ -197,8 +197,42 @@ std::optional<std::string> read_start_key(simdjson::dom::element doc, const core
     return engine::encode_primary_key(def, *map);
 }
 
-// Applies a top-level ProjectionExpression to an item, returning a subset. On an
-// unsupported (document-path) expression sets `unsupported`.
+// Merges a resolved value into the projected output along a document path,
+// creating intermediate maps/lists. List indexes are compacted (AWS returns
+// projected list elements positionally compacted), so each Index step appends.
+void project_merge(std::shared_ptr<core::AttributeValue>& slot,
+                   const std::vector<expressions::PathSegment>& segs, size_t i,
+                   const NameMap& names, const std::shared_ptr<core::AttributeValue>& value) {
+    if (i == segs.size()) { slot = value; return; }
+    const auto& seg = segs[i];
+    if (seg.kind == expressions::PathSegment::Kind::Index) {
+        if (!slot || slot->type != core::AttributeType::L) {
+            slot = std::make_shared<core::AttributeValue>();
+            slot->type = core::AttributeType::L;
+            slot->value = core::ListValue{};
+        }
+        auto& l = std::get<core::ListValue>(slot->value);
+        l.push_back(nullptr);
+        project_merge(l.back(), segs, i + 1, names, value);
+    } else {
+        std::string name = seg.name;
+        if (!name.empty() && name[0] == '#') {
+            auto it = names.find(name);
+            if (it != names.end()) name = it->second;
+        }
+        if (!slot || slot->type != core::AttributeType::M) {
+            slot = std::make_shared<core::AttributeValue>();
+            slot->type = core::AttributeType::M;
+            slot->value = core::MapValue{};
+        }
+        auto& m = std::get<core::MapValue>(slot->value);
+        auto& child = m[core::String(name)];
+        project_merge(child, segs, i + 1, names, value);
+    }
+}
+
+// Applies a ProjectionExpression (comma-separated document paths) to an item,
+// returning a projected sub-document. Sets `unsupported` if a path is malformed.
 AttributeMap apply_projection(const AttributeMap& item, const std::string& projection,
                               const NameMap& names, bool& unsupported) {
     AttributeMap out;
@@ -206,21 +240,24 @@ AttributeMap apply_projection(const AttributeMap& item, const std::string& proje
     while (start <= projection.size()) {
         size_t comma = projection.find(',', start);
         std::string token = projection.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
-        // trim
         size_t b = token.find_first_not_of(" \t\r\n");
         size_t e = token.find_last_not_of(" \t\r\n");
         if (b != std::string::npos) {
             token = token.substr(b, e - b + 1);
-            if (token.find('.') != std::string::npos || token.find('[') != std::string::npos) {
+            auto path = expressions::parse_single_path(token);
+            if (!path || path->segments.empty() ||
+                path->segments.front().kind != expressions::PathSegment::Kind::Name) {
                 unsupported = true;
             } else {
-                std::string name = token;
-                if (!token.empty() && token[0] == '#') {
-                    auto it = names.find(token);
-                    if (it != names.end()) name = it->second;
+                auto value = expressions::Evaluator::resolve_path(*path, item, names);
+                if (value) {
+                    std::string root = path->segments.front().name;
+                    if (!root.empty() && root[0] == '#') {
+                        auto it = names.find(root);
+                        if (it != names.end()) root = it->second;
+                    }
+                    project_merge(out[root], path->segments, 1, names, value);
                 }
-                auto it = item.find(name);
-                if (it != item.end()) out[name] = it->second;
             }
         }
         if (comma == std::string::npos) break;
