@@ -164,6 +164,20 @@ core::TableDefinition JsonParser::parse_table_definition(simdjson::dom::element 
         def.billing_mode = core::BillingMode::PROVISIONED;
     }
 
+    simdjson::dom::element pt;
+    if (el["ProvisionedThroughput"].get(pt) == simdjson::SUCCESS) {
+        int64_t rcu = 0;
+        int64_t wcu = 0;
+        if (pt["ReadCapacityUnits"].get_int64().get(rcu) == simdjson::SUCCESS && rcu > 0) {
+            def.provisioned_throughput.read_capacity_units = static_cast<uint64_t>(rcu);
+        }
+        if (pt["WriteCapacityUnits"].get_int64().get(wcu) == simdjson::SUCCESS && wcu > 0) {
+            def.provisioned_throughput.write_capacity_units = static_cast<uint64_t>(wcu);
+        }
+        // Specifying throughput implies provisioned billing.
+        if (rcu > 0 || wcu > 0) def.billing_mode = core::BillingMode::PROVISIONED;
+    }
+
     return def;
 }
 

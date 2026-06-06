@@ -1307,8 +1307,21 @@ ApiResult handle_transact_get_items(engine::TableManager& tables, engine::Storag
 
 }  // namespace
 
+namespace {
+
+// Classifies the single-table data operations that consume capacity centrally.
+bool is_read_op(Operation op) {
+    return op == Operation::GetItem || op == Operation::Query || op == Operation::Scan;
+}
+bool is_write_op(Operation op) {
+    return op == Operation::PutItem || op == Operation::UpdateItem || op == Operation::DeleteItem;
+}
+
+}  // namespace
+
 ApiResult handle_operation(engine::TableManager& tables, engine::StorageEngine& storage,
-                           Operation op, std::string_view body) {
+                           Operation op, std::string_view body,
+                           engine::capacity::CapacityManager* capacity) {
     simdjson::dom::parser parser;
     // An empty body is valid for some operations (e.g. ListTables); default to {}.
     std::string_view effective_body = body.empty() ? std::string_view("{}") : body;
@@ -1318,12 +1331,28 @@ ApiResult handle_operation(engine::TableManager& tables, engine::StorageEngine& 
         return error(400, "SerializationException", "Could not parse the request body as JSON");
     }
 
+    // Capacity throttling for single-table data ops. A table not yet registered
+    // (TableNotFound) is left to the handler to reject with ResourceNotFound.
+    if (capacity != nullptr && (is_read_op(op) || is_write_op(op))) {
+        std::string_view tname;
+        if (doc["TableName"].get_string().get(tname) == simdjson::SUCCESS) {
+            std::string table(tname);
+            auto consumed = is_read_op(op) ? capacity->consume_rcu(table, 1.0)
+                                           : capacity->consume_wcu(table, 1.0);
+            if (!consumed && consumed.error() == engine::capacity::CapacityError::ProvisionedThroughputExceeded) {
+                return error(400, "ProvisionedThroughputExceededException",
+                             "The level of configured provisioned throughput for the table was exceeded");
+            }
+        }
+    }
+
     try {
+        ApiResult result;
         switch (op) {
-            case Operation::CreateTable:        return handle_create_table(tables, doc);
+            case Operation::CreateTable:        result = handle_create_table(tables, doc); break;
             case Operation::DescribeTable:      return handle_describe_table(tables, doc);
-            case Operation::DeleteTable:        return handle_delete_table(tables, storage, doc);
-            case Operation::UpdateTable:        return handle_update_table(tables, doc);
+            case Operation::DeleteTable:        result = handle_delete_table(tables, storage, doc); break;
+            case Operation::UpdateTable:        result = handle_update_table(tables, doc); break;
             case Operation::UpdateTimeToLive:   return handle_update_time_to_live(tables, doc);
             case Operation::DescribeTimeToLive: return handle_describe_time_to_live(tables, doc);
             case Operation::ListTables:         return handle_list_tables(tables);
@@ -1347,6 +1376,20 @@ ApiResult handle_operation(engine::TableManager& tables, engine::StorageEngine& 
                              "Operation is recognized but not yet implemented by cynamoDB: " +
                                  std::string(ApiDispatcher::to_string(op)));
         }
+
+        // Keep the capacity manager's table registry in sync with table lifecycle.
+        if (capacity != nullptr && result.status == 200) {
+            std::string_view tname;
+            if (doc["TableName"].get_string().get(tname) == simdjson::SUCCESS) {
+                if (op == Operation::CreateTable || op == Operation::UpdateTable) {
+                    auto def = tables.describe_table(tname);
+                    if (def) capacity->register_table(*def);
+                } else if (op == Operation::DeleteTable) {
+                    capacity->unregister_table(std::string(tname));
+                }
+            }
+        }
+        return result;
     } catch (const std::exception& e) {
         return error(400, "ValidationException", std::string("Request could not be processed: ") + e.what());
     }

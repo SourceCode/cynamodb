@@ -119,7 +119,8 @@ void HttpSession::handle_request() {
         api::Operation op = api::ApiDispatcher::parse_target(target);
 
         api::ApiResult result =
-            api::handle_operation(*ctx_.table_manager, *ctx_.storage_engine, op, req_.body());
+            api::handle_operation(*ctx_.table_manager, *ctx_.storage_engine, op, req_.body(),
+                                  ctx_.capacity_manager.get());
 
         res.result(static_cast<http::status>(result.status));
         if (!result.error_type.empty()) {
