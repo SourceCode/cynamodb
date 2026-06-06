@@ -1,4 +1,4 @@
-# AGENTS.md - Technical Specification for AI Agents (v2.3.0)
+# AGENTS.md - Technical Specification for AI Agents (v2.4.0)
 
 ## Overview
 cynamoDB is a high-performance, local DynamoDB-compatible database engine written in C++23. It speaks the DynamoDB HTTP/JSON wire protocol so AWS SDKs and the CLI work against it for local development, testing, and CI.
@@ -18,12 +18,14 @@ cynamoDB is a high-performance, local DynamoDB-compatible database engine writte
 | **Batch & Transactions** | ✅ Implemented | `BatchGetItem`/`BatchWriteItem`; `TransactWriteItems` (all-or-nothing) / `TransactGetItems`. |
 | **Table lifecycle** | ✅ Implemented | `CreateTable`/`DescribeTable`/`ListTables`/`DeleteTable`/`UpdateTable` (minimal). |
 | **LSM Tree Storage** | ✅ Implemented | WAL + memtable + SSTables + compaction; every type survives a flush. |
-| **Expression Engine** | ✅ Implemented | Condition/Filter/Update/KeyCondition. Document paths (`a.b`, `a[0]`) not yet supported. |
-| **SigV4 Authentication** | ⚠️ Optional, partial | `CYNAMODB_REQUIRE_AUTH=1` enforces presence/shape of the SigV4 header; no cryptographic signature verification. |
-| **DynamoDB Streams** | 🚧 Not implemented | Targets return `501 NotImplementedException`. |
-| **TTL Engine** | 🚧 Not implemented | `UpdateTimeToLive`/`DescribeTimeToLive` return `501`; no auto-expiry. |
-| **Secondary Indexes** | 🚧 Not implemented | GSI/LSI definitions are accepted on `CreateTable` but queries cannot target an index. |
-| **Backups / PITR / Global tables / PartiQL** | 🚧 Not implemented | Recognized targets return `501 NotImplementedException`. |
+| **Expression Engine** | ✅ Implemented | Condition/Filter/Update/KeyCondition, incl. document paths (`a.b`, `a[0]`). |
+| **SigV4 Authentication** | ✅ Implemented | `CYNAMODB_REQUIRE_AUTH=1` enforces full SigV4 verification against a credential store. |
+| **DynamoDB Streams** | ✅ Implemented | INSERT/MODIFY/REMOVE records; ListStreams/DescribeStream/GetShardIterator/GetRecords. |
+| **TTL Engine** | ✅ Implemented | UpdateTimeToLive/DescribeTimeToLive; expired items filtered from reads. |
+| **Secondary Indexes** | ✅ Implemented | GSI/LSI parsed, maintained on writes, queryable via `IndexName`. |
+| **Capacity throttling** | ✅ Implemented | Provisioned tables throttle with ProvisionedThroughputExceededException. |
+| **Backups / PITR** | ✅ Implemented | CreateBackup/Restore (durable snapshots); PITR restores current state. |
+| **Global tables / PartiQL** | ✅ Implemented | Single-region global tables; ExecuteStatement/BatchExecuteStatement. |
 
 ## Operational Guidance
 
@@ -41,7 +43,9 @@ CYNAMODB_DATA_DIR=./data CYNAMODB_PORT=8000 ./cynamodb
 - `CYNAMODB_THREADS`: HTTP worker threads (default: hardware concurrency).
 - `CYNAMODB_DATA_DIR`: Directory for LSM persistence (default `./data`).
 - `CYNAMODB_WAL_FSYNC`: Set to `0`/`off` to disable per-write `fdatasync` for throughput.
-- `CYNAMODB_REQUIRE_AUTH`: Set to a truthy value to enforce SigV4 header presence/shape.
+- `CYNAMODB_REQUIRE_AUTH`: Set to a truthy value to enforce full SigV4 verification.
+- `CYNAMODB_ACCESS_KEY_ID` / `CYNAMODB_SECRET_ACCESS_KEY`: the credential used for SigV4
+  verification (default `cynamodb` / `cynamodb-secret`).
 
 ### API Endpoints
 cynamoDB listens on HTTP and responds to the standard DynamoDB JSON protocols (`application/x-amz-json-1.0`).
@@ -74,10 +78,12 @@ aws dynamodb create-table \
 - **Error**: HTTP 400/500 with `__type` and `message` in the body, matching AWS error shapes.
 
 ### Known Limitations
-- **Secondary indexes**: GSI/LSI are not queryable (definitions accepted, `IndexName` ignored).
-- **Streams / TTL / Backups / PITR / Global tables / PartiQL**: recognized but return `501 NotImplementedException`.
-- **Document paths**: expressions operate on top-level attributes only.
-- **SigV4**: presence/shape enforcement only; no cryptographic signature verification.
+- **PITR**: no continuous change log — RestoreTableToPointInTime restores the source's current state.
+- **Global tables**: modeled as a single-region (`ddblocal`) replica.
+- **`ExecuteTransaction`** (PartiQL transactions), Contributor Insights, imports/exports,
+  Kinesis streaming destination, resource policies, tagging, and auto-scaling return
+  `501 NotImplementedException`.
+- **Numeric sort-key ordering** uses a `double` codec (exact to 2⁵³); stored `N` values round-trip exactly.
 - **Cluster Mode**: single-node local engine.
 
 ## Agent-Optimized Reference

@@ -4,6 +4,46 @@ All notable changes to cynamoDB are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/) and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [2.4.0] - 2026-06-06
+
+This release closes the remaining limitations from the v2.3.0 compliance matrix:
+cynamoDB now implements the large majority of the DynamoDB API surface.
+
+### Added
+- **Full SigV4 verification.** Self-contained SHA-256 + HMAC-SHA256 (validated against
+  FIPS/RFC 4231 vectors and the AWS signing-key example); `CYNAMODB_REQUIRE_AUTH` now
+  reconstructs the canonical request, derives the signing key, and compares signatures.
+  A credential store is seeded from `CYNAMODB_ACCESS_KEY_ID`/`CYNAMODB_SECRET_ACCESS_KEY`.
+- **Document-path expressions** (`a.b.c`, `a[0]`) across Condition/Filter/Projection/
+  Update expressions, with copy-on-write so nested mutations never alias shared values.
+- **TTL**: `UpdateTimeToLive`/`DescribeTimeToLive`, persisted; expired items filtered
+  from GetItem (lazy reaping), Query, Scan, Batch/TransactGet.
+- **Capacity throttling**: `ProvisionedThroughput` is parsed and enforced; provisioned
+  tables return `ProvisionedThroughputExceededException` when their bucket is exhausted.
+- **Secondary indexes (GSI/LSI)**: parsed at CreateTable, persisted, maintained on every
+  write (sparse + projection-aware), and queryable via `Query`/`Scan` with `IndexName`.
+- **DynamoDB Streams**: INSERT/MODIFY/REMOVE records (NEW/OLD images per view type) and
+  the data plane (`ListStreams`/`DescribeStream`/`GetShardIterator`/`GetRecords`).
+- **PartiQL**: `ExecuteStatement`/`BatchExecuteStatement` for SELECT/INSERT/UPDATE/DELETE
+  with positional `?` parameters.
+- **Backups / PITR / global tables**: durable JSON backup snapshots
+  (`CreateBackup`/`ListBackups`/`DescribeBackup`/`DeleteBackup`/`RestoreTableFromBackup`),
+  `RestoreTableToPointInTime`, continuous-backups status, and single-region global tables.
+- Table-catalog metadata format extended (v2 TTL, v3 indexes, v4 stream spec); older
+  files still load.
+
+### Fixed
+- Stream manager: the 24-hour retention check compared nanoseconds against epoch-seconds
+  (purging every record immediately), and `append_record` used `map::operator[]` under a
+  shared lock — both fixed.
+- `N`/`NS` attribute values are now JSON-escaped on output.
+
+### Tests
+- New suites: SigV4 crypto + verifier, document paths, TTL, capacity throttling,
+  secondary indexes, streams e2e, PartiQL, backups (incl. cross-restart persistence),
+  and boundary/encoding (large numbers, unicode keys, attribute-name limits). 137 unit
+  cases + 5 integration groups, all passing under AddressSanitizer + UndefinedBehaviorSanitizer.
+
 ## [2.3.0] - 2026-06-06
 
 This release closes the data-integrity gaps and feature holes surfaced by an

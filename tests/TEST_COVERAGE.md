@@ -82,29 +82,36 @@ UndefinedBehaviorSanitizer (`-fno-sanitize-recover=all`).
 - **Transactions** — DONE (best-effort). `TransactWriteItems` verifies all conditions
   before applying any write (all-or-nothing for the no-concurrent-writer case);
   `TransactGetItems` reads. Strict cross-key isolation under contention is future work.
-- **Auth** — DONE. `CYNAMODB_REQUIRE_AUTH` enforces SigV4 header presence/shape
-  (cryptographic signature verification remains future work).
+- **Auth** — DONE (presence/shape only at the time; superseded by v2.4.0 full SigV4).
 - **501 vs UnknownOperation** and **empty-key rejection** — DONE, with tests.
+
+## Addressed in v2.4.0
+
+- **Full SigV4 verification** (`test_sigv4_crypto.cpp`): SHA-256/HMAC KATs, the AWS
+  signing-key vector, canonical-request verification, and credential store.
+- **Document-path expressions** (`test_document_paths.cpp`): nested map/list paths in
+  Condition/Filter/Projection/Update, with copy-on-write.
+- **TTL** (`test_ttl.cpp`), **capacity throttling** (`test_capacity_throttle.cpp`),
+  **GSI/LSI** (`test_secondary_indexes.cpp`), **Streams** (`test_streams_e2e.cpp`),
+  **PartiQL** (`test_partiql_exec.cpp`), **Backups/PITR/global tables**
+  (`test_backups_e2e.cpp`, incl. cross-restart persistence).
+- **Boundary/encoding** (`test_boundary.cpp`): large/high-precision numbers, unicode
+  keys, attribute-name limits, control-character escaping, N sort keys beyond 2⁵³.
 
 ## Remaining gaps to close before production (recommended, prioritized)
 
-These are **not yet built**; they reflect known partial implementations and deeper
-validation that a production deployment warrants.
-
-1. **Secondary indexes (GSI/LSI).** Definitions are accepted but `IndexName` queries are
-   not honored; add replication/projection and end-to-end index query tests.
-2. **Document-path expressions.** `ProjectionExpression`/`UpdateExpression` operate on
-   top-level attributes only; add nested-path (`a.b`, `a[0]`) support.
-3. **Streams / TTL / backups / PITR / global tables / PartiQL.** Recognized but return
-   `501 NotImplementedException`; implement and test as needed.
-4. **SigV4 signature verification.** Enforcement checks presence/shape only; add a
-   credential store and full canonical-request signature comparison.
-5. **Capacity throttling** is implemented but not wired into the request path; wire it
-   and test 4xx throttling responses.
-6. **Soak / leak test.** A long-running mixed-workload test (hours) watching RSS to
+1. **PartiQL transactions** (`ExecuteTransaction`), Contributor Insights, imports/exports,
+   Kinesis streaming destination, resource policies, tagging, and auto-scaling still
+   return `501 NotImplementedException`.
+2. **PITR** restores the source table's current state (no continuous change log), and
+   **global tables** are single-region — both intentional local-engine simplifications.
+3. **Transaction isolation under contention.** `TransactWriteItems` validates all
+   conditions/updates before applying, but is not serializable against a concurrent
+   writer to the same keys mid-transaction.
+4. **Soak / leak test.** A long-running mixed-workload test (hours) watching RSS to
    catch slow leaks and fragmentation under sustained flush/compaction.
-7. **Fuzzing in CI.** Fuzz targets exist (`fuzz_json`, `fuzz_expressions`, `fuzz_sigv4`)
+5. **Fuzzing in CI.** Fuzz targets exist (`fuzz_json`, `fuzz_expressions`, `fuzz_sigv4`)
    but are not run regularly; wire them into a scheduled fuzzing job.
-8. **Boundary/encoding tests.** Very large numbers (beyond 2^53 — the key codec uses
-   double, see ITEMS_TO_FIX §G), unicode keys, max attribute-name length, and
-   duplicate-attribute handling.
+6. **Numeric sort-key precision.** The sort-key ordering codec uses `double` (exact to
+   2⁵³); the stored `N` value round-trips exactly, but ordering of `N` sort keys beyond
+   2⁵³ may collide.

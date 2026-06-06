@@ -1,4 +1,4 @@
-# cynamoDB v2.3.0
+# cynamoDB v2.4.0
 
 cynamoDB is a high-performance, local DynamoDB-compatible database engine written in C++23. It provides 1:1 API compatibility with Amazon DynamoDB, enabling local development, testing, and edge computing without relying on the AWS cloud.
 
@@ -47,7 +47,8 @@ graph TD
    Recognized variables: `CYNAMODB_BIND_ADDR` (default `0.0.0.0`), `CYNAMODB_PORT`
    (default `8000`), `CYNAMODB_THREADS`, `CYNAMODB_DATA_DIR` (default `./data`),
    `CYNAMODB_WAL_FSYNC` (`0` to disable per-write fsync for throughput),
-   `CYNAMODB_REQUIRE_AUTH` (`1` to enforce SigV4 header presence/shape).
+   `CYNAMODB_REQUIRE_AUTH` (`1` to enforce full SigV4 verification),
+   `CYNAMODB_ACCESS_KEY_ID` / `CYNAMODB_SECRET_ACCESS_KEY` (SigV4 credential).
 3. **Use with the AWS CLI / SDKs**:
    ```bash
    aws dynamodb create-table --endpoint-url http://localhost:8000 \
@@ -77,13 +78,23 @@ The HTTP/JSON data plane is implemented end-to-end:
   `ScanIndexForward`.
 - **Batch & transactions**: `BatchGetItem`, `BatchWriteItem`,
   `TransactWriteItems` (all-or-nothing), `TransactGetItems`
+- **Secondary indexes**: GSI/LSI parsed, maintained on every write, and queryable via
+  `Query`/`Scan` with `IndexName` (projection types, sparse indexes)
+- **Streams**: `ListStreams`/`DescribeStream`/`GetShardIterator`/`GetRecords` with
+  INSERT/MODIFY/REMOVE records and NEW/OLD images
+- **TTL**: `UpdateTimeToLive`/`DescribeTimeToLive`; expired items filtered from reads
+- **PartiQL**: `ExecuteStatement`/`BatchExecuteStatement` (SELECT/INSERT/UPDATE/DELETE)
+- **Backups**: `CreateBackup`/`RestoreTableFromBackup`/… (durable snapshots), PITR,
+  continuous backups, and single-region global tables
+- **Document paths** (`a.b.c`, `a[0]`) in all expressions; **provisioned-throughput
+  throttling**; **full SigV4 verification** via `CYNAMODB_REQUIRE_AUTH=1`
 
 **All attribute types round-trip and persist**, including across a memtable→SSTable
 flush: `S`, `N`, `B` (base64), `BOOL`, `NULL`, `M`, `L`, `SS`, `NS`, `BS`.
 
-Recognized-but-unimplemented operations (Streams, TTL, backups/PITR, global tables,
-PartiQL, secondary-index queries) return `501 NotImplementedException` so SDK
-feature-detection works. SigV4 enforcement is opt-in via `CYNAMODB_REQUIRE_AUTH=1`.
+A handful of operations remain `501 NotImplementedException` (PartiQL transactions,
+Contributor Insights, imports/exports, Kinesis streaming, resource policies, tagging,
+auto-scaling).
 
 See [docs/api.md](docs/api.md#api-compliance-status) for the authoritative,
 contract-tested matrix of what is implemented vs. planned, and

@@ -103,7 +103,8 @@ TEST_CASE("SigV4Verifier accepts a correctly signed request and rejects tamperin
     REQUIRE(auth::SigV4Verifier::verify_request(params, cred, vr).has_value());
 
     SECTION("a tampered signature is rejected") {
-        params.signature = std::string(signature.size(), '0');
+        std::string zeros(signature.size(), '0');  // keep storage alive: signature is a string_view
+        params.signature = zeros;
         auto r = auth::SigV4Verifier::verify_request(params, cred, vr);
         REQUIRE_FALSE(r.has_value());
         REQUIRE(r.error() == auth::SigV4VerifyError::SignatureMismatch);
