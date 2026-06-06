@@ -336,8 +336,8 @@ TEST_CASE("DeleteTable and UpdateTable", "[features][tables]") {
 
 TEST_CASE("known-but-unimplemented ops return 501 NotImplementedException", "[features][501]") {
     Harness h;
-    for (auto op : {api::Operation::CreateBackup, api::Operation::ListStreams,
-                    api::Operation::ExecuteStatement, api::Operation::UpdateTimeToLive}) {
+    for (auto op : {api::Operation::DescribeContributorInsights, api::Operation::ImportTable,
+                    api::Operation::DescribeEndpoints, api::Operation::ListExports}) {
         auto r = h.call(op, "{}");
         REQUIRE(r.status == 501);
         REQUIRE(r.error_type == "NotImplementedException");

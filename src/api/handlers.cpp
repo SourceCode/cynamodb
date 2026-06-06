@@ -11,6 +11,7 @@
 #include <simdjson.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <optional>
 #include <string>
@@ -176,6 +177,25 @@ bool key_values_non_empty(const core::TableDefinition& def, const AttributeMap& 
         }
     }
     return true;
+}
+
+int64_t now_epoch_seconds() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+// True if the table has TTL enabled and the item's TTL attribute is a Number whose
+// epoch-seconds value is at or before now (DynamoDB TTL semantics).
+bool item_is_expired(const core::TableDefinition& def, const AttributeMap& item) {
+    if (!def.ttl_specification || !def.ttl_specification->enabled) return false;
+    auto it = item.find(def.ttl_specification->attribute_name);
+    if (it == item.end() || !it->second || it->second->type != core::AttributeType::N) return false;
+    char* end = nullptr;
+    const auto& s = std::get<core::String>(it->second->value);
+    long long ts = std::strtoll(s.c_str(), &end, 10);
+    if (end != s.c_str() + s.size()) return false;  // non-integer TTL is ignored
+    return ts <= now_epoch_seconds();
 }
 
 std::optional<size_t> read_limit(simdjson::dom::element doc) {
@@ -506,6 +526,56 @@ ApiResult handle_update_table(engine::TableManager& tables, simdjson::dom::eleme
     return ok("{\"TableDescription\":" + serialize_table_description(*def) + "}");
 }
 
+ApiResult handle_update_time_to_live(engine::TableManager& tables, simdjson::dom::element doc) {
+    std::string_view name;
+    if (doc["TableName"].get_string().get(name) != simdjson::SUCCESS) {
+        return error(400, "ValidationException", "TableName is required");
+    }
+    simdjson::dom::element spec_el;
+    if (doc["TimeToLiveSpecification"].get(spec_el) != simdjson::SUCCESS) {
+        return error(400, "ValidationException", "TimeToLiveSpecification is required");
+    }
+    std::string_view attr;
+    bool enabled = false;
+    if (spec_el["AttributeName"].get_string().get(attr) != simdjson::SUCCESS) {
+        return error(400, "ValidationException", "TimeToLiveSpecification.AttributeName is required");
+    }
+    if (spec_el["Enabled"].get_bool().get(enabled) != simdjson::SUCCESS) {
+        return error(400, "ValidationException", "TimeToLiveSpecification.Enabled is required");
+    }
+    core::TimeToLiveSpecification spec;
+    spec.attribute_name = std::string(attr);
+    spec.enabled = enabled;
+    auto updated = tables.set_ttl(name, spec);
+    if (!updated) {
+        return error(400, "ResourceNotFoundException",
+                     "Requested resource not found: Table: " + std::string(name) + " not found");
+    }
+    return ok(std::string("{\"TimeToLiveSpecification\":{\"AttributeName\":\"") + std::string(attr) +
+              "\",\"Enabled\":" + (enabled ? "true" : "false") + "}}");
+}
+
+ApiResult handle_describe_time_to_live(engine::TableManager& tables, simdjson::dom::element doc) {
+    std::string_view name;
+    if (doc["TableName"].get_string().get(name) != simdjson::SUCCESS) {
+        return error(400, "ValidationException", "TableName is required");
+    }
+    auto def = tables.describe_table(name);
+    if (!def) {
+        return error(400, "ResourceNotFoundException",
+                     "Requested resource not found: Table: " + std::string(name) + " not found");
+    }
+    std::string out = "{\"TimeToLiveDescription\":{";
+    if (def->ttl_specification && def->ttl_specification->enabled) {
+        out += "\"TimeToLiveStatus\":\"ENABLED\",\"AttributeName\":\"" +
+               def->ttl_specification->attribute_name + "\"";
+    } else {
+        out += "\"TimeToLiveStatus\":\"DISABLED\"";
+    }
+    out += "}}";
+    return ok(std::move(out));
+}
+
 ApiResult handle_list_tables(engine::TableManager& tables) {
     auto names = tables.list_tables();
     std::string out = "{\"TableNames\":[";
@@ -619,6 +689,11 @@ ApiResult handle_get_item(engine::TableManager& tables, engine::StorageEngine& s
     std::string key = engine::encode_primary_key(*def, *key_map);
     auto item = storage.get(std::string(name), key);
     if (!item) {
+        return ok("{}");
+    }
+    if (item_is_expired(*def, *item)) {
+        // Lazily reap the expired item and report it as absent (DynamoDB TTL).
+        storage.remove(std::string(name), key);
         return ok("{}");
     }
 
@@ -802,6 +877,7 @@ ApiResult handle_scan(engine::TableManager& tables, engine::StorageEngine& stora
 
     std::vector<AttributeMap> output;
     for (const auto& item : result.items) {
+        if (item_is_expired(*def, item)) continue;  // TTL: expired items are not returned
         if (has_filter) {
             int r = evaluate_boolean_expr(filter, item, names, *values_opt);
             if (r < 0) return error(400, "ValidationException", "Invalid FilterExpression");
@@ -897,6 +973,7 @@ ApiResult handle_query(engine::TableManager& tables, engine::StorageEngine& stor
     auto result = storage.query(std::string(name), pk_condition, std::nullopt, 0);
     std::vector<AttributeMap> matched;
     for (auto& item : result.items) {
+        if (item_is_expired(*def, item)) continue;  // TTL: expired items are not returned
         if (sort.present) {
             auto it = item.find(sk_name);
             if (it == item.end() || !sort_matches(it->second, sort)) continue;
@@ -1044,7 +1121,7 @@ ApiResult handle_batch_get_item(engine::TableManager& tables, engine::StorageEng
                 return error(400, "ValidationException", "A key does not match the table schema");
             }
             auto item = storage.get(table_name, engine::encode_primary_key(*def, *key_map));
-            if (item) items.push_back(*item);
+            if (item && !item_is_expired(*def, *item)) items.push_back(*item);
         }
         if (!first_table) responses += ",";
         responses += "\"" + table_name + "\":" + items_to_json(items);
@@ -1219,7 +1296,8 @@ ApiResult handle_transact_get_items(engine::TableManager& tables, engine::Storag
         }
         auto item = storage.get(table_name, engine::encode_primary_key(*def, *key_map));
         if (!first) responses += ",";
-        if (item) responses += "{\"Item\":" + json::JsonSerializer::serialize_item(*item) + "}";
+        if (item && !item_is_expired(*def, *item))
+            responses += "{\"Item\":" + json::JsonSerializer::serialize_item(*item) + "}";
         else responses += "{}";
         first = false;
     }
@@ -1246,6 +1324,8 @@ ApiResult handle_operation(engine::TableManager& tables, engine::StorageEngine& 
             case Operation::DescribeTable:      return handle_describe_table(tables, doc);
             case Operation::DeleteTable:        return handle_delete_table(tables, storage, doc);
             case Operation::UpdateTable:        return handle_update_table(tables, doc);
+            case Operation::UpdateTimeToLive:   return handle_update_time_to_live(tables, doc);
+            case Operation::DescribeTimeToLive: return handle_describe_time_to_live(tables, doc);
             case Operation::ListTables:         return handle_list_tables(tables);
             case Operation::PutItem:            return handle_put_item(tables, storage, doc);
             case Operation::GetItem:            return handle_get_item(tables, storage, doc);

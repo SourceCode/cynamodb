@@ -26,6 +26,10 @@ public:
     std::expected<core::TableDefinition, TableError> delete_table(std::string_view table_name);
     std::vector<std::string> list_tables();
 
+    // Sets (or clears) the Time-To-Live specification for a table and persists it.
+    std::expected<core::TableDefinition, TableError> set_ttl(std::string_view table_name,
+                                                             const core::TimeToLiveSpecification& spec);
+
     // Collection size tracking
     void update_collection_size(const std::string& table_name, const std::string& partition_key, int64_t size_delta);
     std::expected<void, TableError> check_collection_limit(const std::string& table_name, const std::string& partition_key, size_t new_item_size);

@@ -45,6 +45,19 @@ std::expected<core::TableDefinition, TableError> TableManager::delete_table(std:
     return removed;
 }
 
+std::expected<core::TableDefinition, TableError> TableManager::set_ttl(
+    std::string_view table_name, const core::TimeToLiveSpecification& spec) {
+    std::unique_lock lock(mutex_);
+    auto it = tables_.find(table_name);
+    if (it == tables_.end()) {
+        return std::unexpected(TableError::TableNotFound);
+    }
+    it->second.ttl_specification = spec;
+    dirty_ = true;
+    save_metadata();
+    return it->second;
+}
+
 std::vector<std::string> TableManager::list_tables() {
     std::shared_lock lock(mutex_);
     std::vector<std::string> names;
@@ -88,7 +101,8 @@ std::expected<void, TableError> TableManager::check_collection_limit(const std::
 namespace {
 
 constexpr uint32_t kMetadataMagic = 0x4359544D;  // "CYTM"
-constexpr uint32_t kMetadataVersion = 1;
+// v2 appends a per-table TTL block; v1 files (no TTL) still load.
+constexpr uint32_t kMetadataVersion = 2;
 
 void write_u32(std::ostream& os, uint32_t v) {
     os.write(reinterpret_cast<const char*>(&v), sizeof(v));
@@ -157,6 +171,15 @@ void TableManager::save_metadata() {
                 write_str(os, attr_name);
                 write_u8(os, static_cast<uint8_t>(attr_type));
             }
+
+            // v2: TTL block — has_ttl flag, then (enabled, attribute_name).
+            if (def.ttl_specification) {
+                write_u8(os, 1);
+                write_u8(os, def.ttl_specification->enabled ? 1 : 0);
+                write_str(os, def.ttl_specification->attribute_name);
+            } else {
+                write_u8(os, 0);
+            }
         }
     }
     // Atomically replace so a crash mid-write never leaves a corrupt catalog.
@@ -176,7 +199,7 @@ void TableManager::load_metadata() {
     uint32_t version = 0;
     uint32_t table_count = 0;
     if (!read_u32(is, magic) || !read_u32(is, version) || !read_u32(is, table_count)) return;
-    if (magic != kMetadataMagic || version != kMetadataVersion) {
+    if (magic != kMetadataMagic || version < 1 || version > kMetadataVersion) {
         std::cerr << "TableManager: unrecognized metadata file, ignoring: " << metadata_path_ << std::endl;
         return;
     }
@@ -208,6 +231,18 @@ void TableManager::load_metadata() {
             uint8_t at = 0;
             if (!read_str(is, attr_name) || !read_u8(is, at)) return;
             def.attribute_definitions[attr_name] = static_cast<core::AttributeType>(at);
+        }
+
+        if (version >= 2) {
+            uint8_t has_ttl = 0;
+            if (!read_u8(is, has_ttl)) return;
+            if (has_ttl != 0) {
+                core::TimeToLiveSpecification spec;
+                uint8_t enabled = 0;
+                if (!read_u8(is, enabled) || !read_str(is, spec.attribute_name)) return;
+                spec.enabled = enabled != 0;
+                def.ttl_specification = spec;
+            }
         }
 
         loaded[def.table_name] = std::move(def);
