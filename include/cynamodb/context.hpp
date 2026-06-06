@@ -19,6 +19,7 @@
 #include <cynamodb/engine/lsm/lsm_engine.hpp>
 #include <cynamodb/streams/manager.hpp>
 #include <cynamodb/backups/manager.hpp>
+#include <cynamodb/auth/credential_store.hpp>
 #include <memory_resource>
 namespace cynamodb {
 
@@ -39,6 +40,7 @@ struct Context {
     std::shared_ptr<engine::StorageEngine> storage_engine;
     std::shared_ptr<streams::StreamManager> stream_manager;
     std::shared_ptr<backups::BackupManager> backup_manager;
+    std::shared_ptr<auth::CredentialStore> credential_store;
     std::mutex transaction_mutex;
     // Opt-in SigV4 enforcement. When true, requests without a parseable
     // AWS4-HMAC-SHA256 Authorization header are rejected. Enabled by setting
@@ -61,6 +63,7 @@ struct Context {
         storage_engine = std::make_shared<engine::lsm::LsmEngine>(data_dir, arena);
         stream_manager = std::make_shared<streams::StreamManager>();
         backup_manager = std::make_shared<backups::BackupManager>(data_dir + "/backups");
+        credential_store = std::make_shared<auth::CredentialStore>();
         for (const auto& table_name : table_manager->list_tables()) {
             auto table_def = table_manager->describe_table(table_name);
             if (table_def) stream_manager->sync_table(*table_def);

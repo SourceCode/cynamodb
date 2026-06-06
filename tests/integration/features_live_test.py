@@ -312,10 +312,51 @@ def test_error_shapes(client):
     check_eq(body, {}, "miss returns canonical {}")
 
 
+def _sigv4_headers(access_key, secret_key, port, target, payload):
+    """Produce a correct AWS SigV4 Authorization header (independent reference impl)."""
+    import datetime
+    import hashlib
+    import hmac
+
+    region, service = "us-east-1", "dynamodb"
+    now = datetime.datetime.now(datetime.timezone.utc)
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = now.strftime("%Y%m%d")
+    host = f"127.0.0.1:{port}"
+
+    payload_hash = hashlib.sha256(payload).hexdigest()
+    canonical_headers = f"host:{host}\nx-amz-date:{amz_date}\n"
+    signed_headers = "host;x-amz-date"
+    canonical_request = f"POST\n/\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+
+    scope = f"{date_stamp}/{region}/{service}/aws4_request"
+    sts = ("AWS4-HMAC-SHA256\n" + amz_date + "\n" + scope + "\n" +
+           hashlib.sha256(canonical_request.encode()).hexdigest())
+
+    def _hmac(key, msg):
+        return hmac.new(key, msg.encode(), hashlib.sha256).digest()
+
+    k_date = _hmac(("AWS4" + secret_key).encode(), date_stamp)
+    k_region = _hmac(k_date, region)
+    k_service = _hmac(k_region, service)
+    k_signing = _hmac(k_service, "aws4_request")
+    signature = hmac.new(k_signing, sts.encode(), hashlib.sha256).hexdigest()
+
+    authorization = (f"AWS4-HMAC-SHA256 Credential={access_key}/{scope}, "
+                     f"SignedHeaders={signed_headers}, Signature={signature}")
+    # urllib sets Host itself to 127.0.0.1:<port>, which is what we signed over.
+    return {"Authorization": authorization, "x-amz-date": amz_date}
+
+
 def test_auth_enforcement(binary, data_dir, log_path):
-    print("  [auth] CYNAMODB_REQUIRE_AUTH rejects unsigned requests")
+    print("  [auth] CYNAMODB_REQUIRE_AUTH enforces real SigV4 signatures")
+    access_key, secret_key = "AKIDLIVETEST", "live-test-secret"
     port = free_port()
-    server = Server(binary, data_dir, port, log_path, extra_env={"CYNAMODB_REQUIRE_AUTH": "1"})
+    server = Server(binary, data_dir, port, log_path, extra_env={
+        "CYNAMODB_REQUIRE_AUTH": "1",
+        "CYNAMODB_ACCESS_KEY_ID": access_key,
+        "CYNAMODB_SECRET_ACCESS_KEY": secret_key,
+    })
     server.start()
     try:
         anon = Client(port)
@@ -323,12 +364,22 @@ def test_auth_enforcement(binary, data_dir, log_path):
         check_eq(status, 400, "anon request rejected status")
         check_eq(err_type(body), "MissingAuthenticationTokenException", "anon rejected type")
 
-        signed = Client(port, headers={
-            "Authorization": "AWS4-HMAC-SHA256 "
-                             "Credential=AKIDEXAMPLE/20260606/us-east-1/dynamodb/aws4_request, "
-                             "SignedHeaders=host;x-amz-date, Signature=abcd1234"})
-        status, _ = signed.call("ListTables", {})
-        check_eq(status, 200, "signed request accepted")
+        # A correctly signed request is accepted.
+        payload = json.dumps({}).encode()
+        good = Client(port, headers=_sigv4_headers(access_key, secret_key, port, "ListTables", payload))
+        status, _ = good.call("ListTables", {})
+        check_eq(status, 200, "correctly signed request accepted")
+
+        # A request signed with the wrong secret is rejected with InvalidSignature.
+        bad = Client(port, headers=_sigv4_headers(access_key, "WRONG-SECRET", port, "ListTables", payload))
+        status, body = bad.call("ListTables", {})
+        check_eq(status, 400, "bad-signature request rejected status")
+        check_eq(err_type(body), "InvalidSignatureException", "bad-signature type")
+
+        # An unknown access key is rejected.
+        unknown = Client(port, headers=_sigv4_headers("AKIDUNKNOWN", secret_key, port, "ListTables", payload))
+        status, body = unknown.call("ListTables", {})
+        check_eq(err_type(body), "UnrecognizedClientException", "unknown access key type")
     finally:
         server.stop()
 

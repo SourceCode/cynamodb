@@ -135,22 +135,56 @@ void HttpSession::handle_request() {
 std::optional<api::ApiResult> HttpSession::check_auth() {
     if (!ctx_.require_auth) return std::nullopt;
 
-    auto auth_view = req_[http::field::authorization];
     auto make_error = [](const std::string& type, const std::string& message) {
         return api::ApiResult{
             400, "com.amazonaws.dynamodb.v20120810#" + type,
             json::JsonSerializer::serialize_error("com.amazonaws.dynamodb.v20120810#" + type, message)};
     };
 
+    auto auth_view = req_[http::field::authorization];
     if (auth_view.empty()) {
         return make_error("MissingAuthenticationTokenException",
                           "Request is missing Authentication Token");
     }
-    std::string_view auth(auth_view.data(), auth_view.size());
-    auto parsed = auth::SigV4Parser::parse_authorization_header(auth);
+    // Keep the header bytes alive for the lifetime of the SigV4 string_views.
+    const std::string auth_header(auth_view.data(), auth_view.size());
+    auto parsed = auth::SigV4Parser::parse_authorization_header(auth_header);
     if (!parsed) {
         return make_error("IncompleteSignatureException",
                           "Authorization header requires a valid AWS4-HMAC-SHA256 credential and signature");
+    }
+
+    // Resolve the secret for the presented access key.
+    auto secret = ctx_.credential_store->secret_for(std::string(parsed->access_key));
+    if (!secret) {
+        return make_error("UnrecognizedClientException",
+                          "The security token included in the request is invalid (unknown access key)");
+    }
+
+    // Build the canonical-request inputs from the live HTTP request. DynamoDB uses
+    // POST "/" with no query string; the payload is the raw body.
+    auth::SigV4Credential credential;
+    credential.access_key = core::String(parsed->access_key);
+    credential.secret_key = core::String(*secret);
+
+    auth::SigV4VerifyRequest vr;
+    vr.method = "POST";
+    vr.canonical_uri = "/";
+    vr.canonical_query_string = "";
+    vr.payload = req_.body();
+    for (const auto& name : parsed->signed_headers) {
+        auto hv = req_[std::string(name)];  // beast lookup is case-insensitive
+        vr.signed_header_values[name] = std::string_view(hv.data(), hv.size());
+    }
+
+    auto verified = auth::SigV4Verifier::verify_request(*parsed, credential, vr);
+    if (!verified) {
+        const auto err = verified.error();
+        if (err == auth::SigV4VerifyError::MissingSignedHeader) {
+            return make_error("IncompleteSignatureException", "A required signed header was not present");
+        }
+        return make_error("InvalidSignatureException",
+                          "The request signature we calculated does not match the signature you provided");
     }
     return std::nullopt;
 }
