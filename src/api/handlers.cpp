@@ -344,6 +344,25 @@ void maintain_indexes(engine::StorageEngine& storage, const core::TableDefinitio
     }
 }
 
+// ---- Streams helpers ----------------------------------------------------
+
+AttributeMap extract_keys(const core::TableDefinition& def, const AttributeMap& item) {
+    AttributeMap keys;
+    for (const auto& ks : def.key_schema) {
+        auto it = item.find(ks.attribute_name);
+        if (it != item.end()) keys[it->first] = it->second;
+    }
+    return keys;
+}
+
+void emit_stream(streams::StreamManager* streams, const core::TableDefinition& def,
+                 std::string_view event, const AttributeMap& keys,
+                 const std::optional<AttributeMap>& old_image,
+                 const std::optional<AttributeMap>& new_image) {
+    if (streams == nullptr || !streams->is_stream_enabled(def)) return;
+    streams->append_record(def, event, keys, old_image, new_image);
+}
+
 std::optional<size_t> read_limit(simdjson::dom::element doc) {
     int64_t limit = 0;
     if (doc["Limit"].get_int64().get(limit) == simdjson::SUCCESS && limit > 0) {
@@ -738,7 +757,7 @@ ApiResult handle_list_tables(engine::TableManager& tables) {
 }
 
 ApiResult handle_put_item(engine::TableManager& tables, engine::StorageEngine& storage,
-                          simdjson::dom::element doc) {
+                          simdjson::dom::element doc, streams::StreamManager* streams) {
     std::string_view name;
     if (doc["TableName"].get_string().get(name) != simdjson::SUCCESS) {
         return error(400, "ValidationException", "TableName is required");
@@ -807,6 +826,8 @@ ApiResult handle_put_item(engine::TableManager& tables, engine::StorageEngine& s
     if (condition_failed) return error(400, "ConditionalCheckFailedException", "The conditional request failed");
 
     maintain_indexes(storage, *def, outcome.previous ? &*outcome.previous : nullptr, &*item);
+    emit_stream(streams, *def, outcome.previous ? "MODIFY" : "INSERT", extract_keys(*def, *item),
+                outcome.previous, *item);
 
     if (return_values == "ALL_OLD" && outcome.previous) {
         return ok("{\"Attributes\":" + json::JsonSerializer::serialize_item(*outcome.previous) + "}");
@@ -864,7 +885,7 @@ ApiResult handle_get_item(engine::TableManager& tables, engine::StorageEngine& s
 }
 
 ApiResult handle_delete_item(engine::TableManager& tables, engine::StorageEngine& storage,
-                             simdjson::dom::element doc) {
+                             simdjson::dom::element doc, streams::StreamManager* streams) {
     std::string_view name;
     if (doc["TableName"].get_string().get(name) != simdjson::SUCCESS) {
         return error(400, "ValidationException", "TableName is required");
@@ -915,7 +936,10 @@ ApiResult handle_delete_item(engine::TableManager& tables, engine::StorageEngine
     if (parse_error) return error(400, "ValidationException", "Invalid ConditionExpression");
     if (condition_failed) return error(400, "ConditionalCheckFailedException", "The conditional request failed");
 
-    if (outcome.previous) maintain_indexes(storage, *def, &*outcome.previous, nullptr);
+    if (outcome.previous) {
+        maintain_indexes(storage, *def, &*outcome.previous, nullptr);
+        emit_stream(streams, *def, "REMOVE", extract_keys(*def, *outcome.previous), outcome.previous, std::nullopt);
+    }
 
     if (return_values == "ALL_OLD" && outcome.previous) {
         return ok("{\"Attributes\":" + json::JsonSerializer::serialize_item(*outcome.previous) + "}");
@@ -924,7 +948,7 @@ ApiResult handle_delete_item(engine::TableManager& tables, engine::StorageEngine
 }
 
 ApiResult handle_update_item(engine::TableManager& tables, engine::StorageEngine& storage,
-                             simdjson::dom::element doc) {
+                             simdjson::dom::element doc, streams::StreamManager* streams) {
     std::string_view name;
     if (doc["TableName"].get_string().get(name) != simdjson::SUCCESS) {
         return error(400, "ValidationException", "TableName is required");
@@ -996,6 +1020,8 @@ ApiResult handle_update_item(engine::TableManager& tables, engine::StorageEngine
     if (!update_error.empty()) return error(400, "ValidationException", update_error);
 
     maintain_indexes(storage, *def, outcome.previous ? &*outcome.previous : nullptr, &new_item);
+    emit_stream(streams, *def, outcome.previous ? "MODIFY" : "INSERT", extract_keys(*def, new_item),
+                outcome.previous, new_item);
 
     if (return_values == "ALL_NEW" || return_values == "UPDATED_NEW") {
         return ok("{\"Attributes\":" + json::JsonSerializer::serialize_item(new_item) + "}");
@@ -1326,7 +1352,7 @@ ApiResult handle_query(engine::TableManager& tables, engine::StorageEngine& stor
 // ---- Batch & transaction handlers ---------------------------------------
 
 ApiResult handle_batch_write_item(engine::TableManager& tables, engine::StorageEngine& storage,
-                                  simdjson::dom::element doc) {
+                                  simdjson::dom::element doc, streams::StreamManager* streams) {
     simdjson::dom::object request_items;
     if (doc["RequestItems"].get_object().get(request_items) != simdjson::SUCCESS) {
         return error(400, "ValidationException", "RequestItems is required");
@@ -1381,12 +1407,17 @@ ApiResult handle_batch_write_item(engine::TableManager& tables, engine::StorageE
                                      !def->local_secondary_indexes.empty());
         std::optional<AttributeMap> old;
         if (has_idx) old = storage.get(op.table, op.key);
+        const bool has_stream = def && streams != nullptr && streams->is_stream_enabled(*def);
+        if (!has_idx && has_stream) old = storage.get(op.table, op.key);  // need old image for the record
         if (op.is_delete) {
             storage.remove(op.table, op.key);
             if (has_idx) maintain_indexes(storage, *def, old ? &*old : nullptr, nullptr);
+            if (has_stream && old) emit_stream(streams, *def, "REMOVE", extract_keys(*def, *old), old, std::nullopt);
         } else {
             storage.put(op.table, op.key, op.item);
             if (has_idx) maintain_indexes(storage, *def, old ? &*old : nullptr, &op.item);
+            if (has_stream) emit_stream(streams, *def, old ? "MODIFY" : "INSERT",
+                                        extract_keys(*def, op.item), old, op.item);
         }
     }
     return ok("{\"UnprocessedItems\":{}}");
@@ -1429,7 +1460,7 @@ ApiResult handle_batch_get_item(engine::TableManager& tables, engine::StorageEng
 }
 
 ApiResult handle_transact_write_items(engine::TableManager& tables, engine::StorageEngine& storage,
-                                      simdjson::dom::element doc) {
+                                      simdjson::dom::element doc, streams::StreamManager* streams) {
     simdjson::dom::array transact_items;
     if (doc["TransactItems"].get_array().get(transact_items) != simdjson::SUCCESS) {
         return error(400, "ValidationException", "TransactItems is required");
@@ -1555,17 +1586,23 @@ ApiResult handle_transact_write_items(engine::TableManager& tables, engine::Stor
         auto def = tables.describe_table(a.table);
         const bool has_idx = def && (!def->global_secondary_indexes.empty() ||
                                      !def->local_secondary_indexes.empty());
+        const bool has_stream = def && streams != nullptr && streams->is_stream_enabled(*def);
         std::optional<AttributeMap> old;
-        if (has_idx) old = storage.get(a.table, a.key);
+        if (has_idx || has_stream) old = storage.get(a.table, a.key);
         if (a.kind == 0) {
             storage.put(a.table, a.key, a.item);
             if (has_idx) maintain_indexes(storage, *def, old ? &*old : nullptr, &a.item);
+            if (has_stream) emit_stream(streams, *def, old ? "MODIFY" : "INSERT",
+                                        extract_keys(*def, a.item), old, a.item);
         } else if (a.kind == 1) {
             storage.remove(a.table, a.key);
             if (has_idx) maintain_indexes(storage, *def, old ? &*old : nullptr, nullptr);
+            if (has_stream && old) emit_stream(streams, *def, "REMOVE", extract_keys(*def, *old), old, std::nullopt);
         } else if (a.kind == 2) {
             storage.put(a.table, a.key, precomputed_updates[i]);
             if (has_idx) maintain_indexes(storage, *def, old ? &*old : nullptr, &precomputed_updates[i]);
+            if (has_stream) emit_stream(streams, *def, old ? "MODIFY" : "INSERT",
+                                        extract_keys(*def, precomputed_updates[i]), old, precomputed_updates[i]);
         }
     }
     return ok("{}");
@@ -1610,6 +1647,136 @@ ApiResult handle_transact_get_items(engine::TableManager& tables, engine::Storag
     return ok("{\"Responses\":" + responses + "}");
 }
 
+// ---- DynamoDB Streams data plane ----------------------------------------
+
+std::string stream_view_type_str(core::StreamViewType v) {
+    switch (v) {
+        case core::StreamViewType::KEYS_ONLY: return "KEYS_ONLY";
+        case core::StreamViewType::NEW_IMAGE: return "NEW_IMAGE";
+        case core::StreamViewType::OLD_IMAGE: return "OLD_IMAGE";
+        default: return "NEW_AND_OLD_IMAGES";
+    }
+}
+
+std::string serialize_stream_record(const streams::StreamRecord& r, core::StreamViewType view) {
+    std::string out = "{\"eventID\":\"" + r.event_id + "\",\"eventName\":\"" + r.event_name +
+                      "\",\"eventVersion\":\"1.1\",\"eventSource\":\"aws:dynamodb\",\"dynamodb\":{";
+    out += "\"ApproximateCreationDateTime\":" + std::to_string(r.approximate_creation_date_time);
+    out += ",\"Keys\":" + json::JsonSerializer::serialize_item(r.keys);
+    if (r.new_image) out += ",\"NewImage\":" + json::JsonSerializer::serialize_item(*r.new_image);
+    if (r.old_image) out += ",\"OldImage\":" + json::JsonSerializer::serialize_item(*r.old_image);
+    out += ",\"SequenceNumber\":\"" + r.sequence_number + "\"";
+    out += ",\"SizeBytes\":" + std::to_string(r.size_bytes);
+    out += ",\"StreamViewType\":\"" + stream_view_type_str(view) + "\"}}";
+    return out;
+}
+
+std::string serialize_stream_description(const streams::StreamDescription& d) {
+    std::string out = "{\"StreamArn\":\"" + d.stream_arn + "\",\"StreamLabel\":\"" + d.stream_label +
+                      "\",\"StreamStatus\":\"" + d.stream_status + "\",\"StreamViewType\":\"" +
+                      stream_view_type_str(d.stream_view_type) + "\",\"CreationRequestDateTime\":" +
+                      std::to_string(d.creation_request_date_time) + ",\"TableName\":\"" + d.table_name +
+                      "\",\"Shards\":[";
+    for (size_t i = 0; i < d.shards.size(); ++i) {
+        const auto& s = d.shards[i];
+        if (i) out += ",";
+        out += "{\"ShardId\":\"" + s.shard_id + "\",\"SequenceNumberRange\":{\"StartingSequenceNumber\":\"" +
+               s.sequence_number_range.starting_sequence_number + "\"";
+        if (s.sequence_number_range.ending_sequence_number) {
+            out += ",\"EndingSequenceNumber\":\"" + *s.sequence_number_range.ending_sequence_number + "\"";
+        }
+        out += "}}";
+    }
+    out += "]}";
+    return out;
+}
+
+ApiResult stream_error(streams::StreamError e) {
+    switch (e) {
+        case streams::StreamError::ResourceNotFound:
+            return error(400, "ResourceNotFoundException", "Requested resource not found");
+        case streams::StreamError::ExpiredIterator:
+            return error(400, "ExpiredIteratorException", "The shard iterator has expired");
+        case streams::StreamError::LimitExceeded:
+            return error(400, "LimitExceededException", "Too many requests");
+        default:
+            return error(500, "InternalServerError", "Stream operation failed");
+    }
+}
+
+ApiResult handle_list_streams(streams::StreamManager& streams, simdjson::dom::element doc) {
+    std::optional<std::string> table_name;
+    std::string_view tn;
+    if (doc["TableName"].get_string().get(tn) == simdjson::SUCCESS) table_name = std::string(tn);
+    std::optional<std::string> start;
+    std::string_view sa;
+    if (doc["ExclusiveStartStreamArn"].get_string().get(sa) == simdjson::SUCCESS) start = std::string(sa);
+    size_t limit = read_limit(doc).value_or(100);
+
+    auto res = streams.list_streams(table_name, start, limit);
+    if (!res) return stream_error(res.error());
+    std::string out = "{\"Streams\":[";
+    for (size_t i = 0; i < res->streams.size(); ++i) {
+        const auto& s = res->streams[i];
+        if (i) out += ",";
+        out += "{\"StreamArn\":\"" + s.stream_arn + "\",\"TableName\":\"" + s.table_name +
+               "\",\"StreamLabel\":\"" + s.stream_label + "\"}";
+    }
+    out += "]";
+    if (res->last_evaluated_stream_arn) out += ",\"LastEvaluatedStreamArn\":\"" + *res->last_evaluated_stream_arn + "\"";
+    out += "}";
+    return ok(std::move(out));
+}
+
+ApiResult handle_describe_stream(streams::StreamManager& streams, simdjson::dom::element doc) {
+    std::string_view arn;
+    if (doc["StreamArn"].get_string().get(arn) != simdjson::SUCCESS) {
+        return error(400, "ValidationException", "StreamArn is required");
+    }
+    std::optional<std::string> start_shard;
+    std::string_view ss;
+    if (doc["ExclusiveStartShardId"].get_string().get(ss) == simdjson::SUCCESS) start_shard = std::string(ss);
+    auto res = streams.describe_stream(arn, start_shard, read_limit(doc).value_or(100));
+    if (!res) return stream_error(res.error());
+    return ok("{\"StreamDescription\":" + serialize_stream_description(*res) + "}");
+}
+
+ApiResult handle_get_shard_iterator(streams::StreamManager& streams, simdjson::dom::element doc) {
+    std::string_view arn;
+    std::string_view shard;
+    std::string_view itype;
+    if (doc["StreamArn"].get_string().get(arn) != simdjson::SUCCESS ||
+        doc["ShardId"].get_string().get(shard) != simdjson::SUCCESS ||
+        doc["ShardIteratorType"].get_string().get(itype) != simdjson::SUCCESS) {
+        return error(400, "ValidationException", "StreamArn, ShardId and ShardIteratorType are required");
+    }
+    std::optional<std::string> seq;
+    std::string_view sn;
+    if (doc["SequenceNumber"].get_string().get(sn) == simdjson::SUCCESS) seq = std::string(sn);
+    auto res = streams.create_shard_iterator(arn, shard, itype, seq);
+    if (!res) return stream_error(res.error());
+    return ok("{\"ShardIterator\":\"" + *res + "\"}");
+}
+
+ApiResult handle_get_records(streams::StreamManager& streams, simdjson::dom::element doc) {
+    std::string_view it;
+    if (doc["ShardIterator"].get_string().get(it) != simdjson::SUCCESS) {
+        return error(400, "ValidationException", "ShardIterator is required");
+    }
+    auto res = streams.get_records(it, read_limit(doc).value_or(1000));
+    if (!res) return stream_error(res.error());
+    std::string out = "{\"Records\":[";
+    for (size_t i = 0; i < res->records.size(); ++i) {
+        if (i) out += ",";
+        // The record carries its own images; view type is informational here.
+        out += serialize_stream_record(res->records[i], core::StreamViewType::NEW_AND_OLD_IMAGES);
+    }
+    out += "]";
+    if (res->next_shard_iterator) out += ",\"NextShardIterator\":\"" + *res->next_shard_iterator + "\"";
+    out += "}";
+    return ok(std::move(out));
+}
+
 }  // namespace
 
 namespace {
@@ -1626,7 +1793,8 @@ bool is_write_op(Operation op) {
 
 ApiResult handle_operation(engine::TableManager& tables, engine::StorageEngine& storage,
                            Operation op, std::string_view body,
-                           engine::capacity::CapacityManager* capacity) {
+                           engine::capacity::CapacityManager* capacity,
+                           streams::StreamManager* streams) {
     simdjson::dom::parser parser;
     // An empty body is valid for some operations (e.g. ListTables); default to {}.
     std::string_view effective_body = body.empty() ? std::string_view("{}") : body;
@@ -1652,7 +1820,11 @@ ApiResult handle_operation(engine::TableManager& tables, engine::StorageEngine& 
     }
 
     try {
-        ApiResult result;
+        // Default covers recognized-but-unimplemented ops and stream ops reached
+        // without a stream manager; lifecycle ops overwrite it below.
+        ApiResult result = error(501, "NotImplementedException",
+                                 "Operation is recognized but not yet implemented by cynamoDB: " +
+                                     std::string(ApiDispatcher::to_string(op)));
         switch (op) {
             case Operation::CreateTable:        result = handle_create_table(tables, doc); break;
             case Operation::DescribeTable:      return handle_describe_table(tables, doc);
@@ -1661,16 +1833,28 @@ ApiResult handle_operation(engine::TableManager& tables, engine::StorageEngine& 
             case Operation::UpdateTimeToLive:   return handle_update_time_to_live(tables, doc);
             case Operation::DescribeTimeToLive: return handle_describe_time_to_live(tables, doc);
             case Operation::ListTables:         return handle_list_tables(tables);
-            case Operation::PutItem:            return handle_put_item(tables, storage, doc);
+            case Operation::PutItem:            return handle_put_item(tables, storage, doc, streams);
             case Operation::GetItem:            return handle_get_item(tables, storage, doc);
-            case Operation::DeleteItem:         return handle_delete_item(tables, storage, doc);
-            case Operation::UpdateItem:         return handle_update_item(tables, storage, doc);
+            case Operation::DeleteItem:         return handle_delete_item(tables, storage, doc, streams);
+            case Operation::UpdateItem:         return handle_update_item(tables, storage, doc, streams);
             case Operation::Scan:               return handle_scan(tables, storage, doc);
             case Operation::Query:              return handle_query(tables, storage, doc);
-            case Operation::BatchWriteItem:     return handle_batch_write_item(tables, storage, doc);
+            case Operation::BatchWriteItem:     return handle_batch_write_item(tables, storage, doc, streams);
             case Operation::BatchGetItem:       return handle_batch_get_item(tables, storage, doc);
-            case Operation::TransactWriteItems: return handle_transact_write_items(tables, storage, doc);
+            case Operation::TransactWriteItems: return handle_transact_write_items(tables, storage, doc, streams);
             case Operation::TransactGetItems:   return handle_transact_get_items(tables, storage, doc);
+            case Operation::ListStreams:
+                if (streams) return handle_list_streams(*streams, doc);
+                break;
+            case Operation::DescribeStream:
+                if (streams) return handle_describe_stream(*streams, doc);
+                break;
+            case Operation::GetShardIterator:
+                if (streams) return handle_get_shard_iterator(*streams, doc);
+                break;
+            case Operation::GetRecords:
+                if (streams) return handle_get_records(*streams, doc);
+                break;
             case Operation::Unknown:
                 return error(400, "UnknownOperationException",
                              "Unknown operation requested of cynamoDB");
@@ -1682,15 +1866,19 @@ ApiResult handle_operation(engine::TableManager& tables, engine::StorageEngine& 
                                  std::string(ApiDispatcher::to_string(op)));
         }
 
-        // Keep the capacity manager's table registry in sync with table lifecycle.
-        if (capacity != nullptr && result.status == 200) {
+        // Keep the capacity manager and stream manager in sync with table lifecycle.
+        if (result.status == 200) {
             std::string_view tname;
             if (doc["TableName"].get_string().get(tname) == simdjson::SUCCESS) {
                 if (op == Operation::CreateTable || op == Operation::UpdateTable) {
                     auto def = tables.describe_table(tname);
-                    if (def) capacity->register_table(*def);
+                    if (def) {
+                        if (capacity != nullptr) capacity->register_table(*def);
+                        if (streams != nullptr) streams->sync_table(*def);
+                    }
                 } else if (op == Operation::DeleteTable) {
-                    capacity->unregister_table(std::string(tname));
+                    if (capacity != nullptr) capacity->unregister_table(std::string(tname));
+                    if (streams != nullptr) streams->remove_table(tname);
                 }
             }
         }

@@ -104,14 +104,21 @@ void StreamManager::append_record(
 
     {
         std::shared_lock lock(mutex_);
-        auto& state = streams_by_arn_[arn];
+        auto sit = streams_by_arn_.find(arn);
+        if (sit == streams_by_arn_.end()) return;
+        auto& state = sit->second;
         std::lock_guard r_lock(*state.records_mutex);
         record.sequence_number = std::to_string(state.records.size() + 1);
         state.records.push_back(std::move(record));
         
-        // 24 hour retention (Task 10) - simplified cleanup here
-        while (!state.records.empty() && 
-               (std::chrono::system_clock::now().time_since_epoch().count() - state.records.front().approximate_creation_date_time > 86400)) {
+        // 24-hour retention. Compare in seconds — approximate_creation_date_time is
+        // epoch seconds, so the now() value must be seconds too (using the raw clock
+        // count, which is nanoseconds, purged every record immediately).
+        const uint64_t now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+        while (!state.records.empty() &&
+               now_s - state.records.front().approximate_creation_date_time > 86400) {
             state.records.pop_front();
         }
     }

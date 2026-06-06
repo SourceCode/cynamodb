@@ -226,6 +226,21 @@ core::TableDefinition JsonParser::parse_table_definition(simdjson::dom::element 
         def.billing_mode = core::BillingMode::PROVISIONED;
     }
 
+    simdjson::dom::element ss;
+    if (el["StreamSpecification"].get(ss) == simdjson::SUCCESS) {
+        core::StreamSpecification spec;
+        bool enabled = false;
+        if (ss["StreamEnabled"].get_bool().get(enabled) == simdjson::SUCCESS) spec.stream_enabled = enabled;
+        std::string_view svt;
+        if (ss["StreamViewType"].get_string().get(svt) == simdjson::SUCCESS) {
+            if (svt == "KEYS_ONLY") spec.stream_view_type = core::StreamViewType::KEYS_ONLY;
+            else if (svt == "NEW_IMAGE") spec.stream_view_type = core::StreamViewType::NEW_IMAGE;
+            else if (svt == "OLD_IMAGE") spec.stream_view_type = core::StreamViewType::OLD_IMAGE;
+            else spec.stream_view_type = core::StreamViewType::NEW_AND_OLD_IMAGES;
+        }
+        def.stream_specification = spec;
+    }
+
     simdjson::dom::element pt;
     if (el["ProvisionedThroughput"].get(pt) == simdjson::SUCCESS) {
         int64_t rcu = 0;

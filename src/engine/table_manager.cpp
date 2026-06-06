@@ -101,9 +101,9 @@ std::expected<void, TableError> TableManager::check_collection_limit(const std::
 namespace {
 
 constexpr uint32_t kMetadataMagic = 0x4359544D;  // "CYTM"
-// v2 appends a per-table TTL block; v3 appends GSI/LSI definitions. Older files
-// (without those trailing blocks) still load.
-constexpr uint32_t kMetadataVersion = 3;
+// v2 appends a per-table TTL block; v3 appends GSI/LSI definitions; v4 appends a
+// stream specification. Older files (without those trailing blocks) still load.
+constexpr uint32_t kMetadataVersion = 4;
 
 void write_u32(std::ostream& os, uint32_t v) {
     os.write(reinterpret_cast<const char*>(&v), sizeof(v));
@@ -206,6 +206,20 @@ void TableManager::save_metadata() {
                 write_str(os, lsi.index_name);
                 write_key_schema(lsi.key_schema);
                 write_projection(lsi.projection);
+            }
+
+            // v4: stream specification.
+            if (def.stream_specification) {
+                write_u8(os, 1);
+                write_u8(os, def.stream_specification->stream_enabled ? 1 : 0);
+                if (def.stream_specification->stream_view_type) {
+                    write_u8(os, 1);
+                    write_u8(os, static_cast<uint8_t>(*def.stream_specification->stream_view_type));
+                } else {
+                    write_u8(os, 0);
+                }
+            } else {
+                write_u8(os, 0);
             }
         }
     }
@@ -312,6 +326,24 @@ void TableManager::load_metadata() {
                 if (!read_str(is, lsi.index_name) || !read_key_schema(lsi.key_schema) ||
                     !read_projection(lsi.projection)) return;
                 def.local_secondary_indexes.push_back(std::move(lsi));
+            }
+        }
+
+        if (version >= 4) {
+            uint8_t has_stream = 0;
+            if (!read_u8(is, has_stream)) return;
+            if (has_stream != 0) {
+                core::StreamSpecification spec;
+                uint8_t enabled = 0;
+                uint8_t has_view = 0;
+                if (!read_u8(is, enabled) || !read_u8(is, has_view)) return;
+                spec.stream_enabled = enabled != 0;
+                if (has_view != 0) {
+                    uint8_t vt = 0;
+                    if (!read_u8(is, vt)) return;
+                    spec.stream_view_type = static_cast<core::StreamViewType>(vt);
+                }
+                def.stream_specification = spec;
             }
         }
 
