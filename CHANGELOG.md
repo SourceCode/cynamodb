@@ -4,6 +4,30 @@ All notable changes to cynamoDB are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/) and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [2.4.3] - 2026-06-07
+
+HTTP-layer correctness, addressing the QA battery's three observational (`info`) probes.
+
+### Changed
+- **Method handling.** Non-`POST` requests to the data-plane endpoint now return
+  `405 Method Not Allowed` with an `Allow: POST` header instead of being routed through
+  the operation dispatcher (`GET /` previously returned a generic 400). `GET`/`HEAD`
+  `/health` still return 200.
+- **Content-Type negotiation.** The response `Content-Type` now echoes the DynamoDB JSON
+  protocol version the client used (`application/x-amz-json-1.0` or `-1.1`). Request
+  Content-Type remains lenient, matching AWS.
+
+### Notes
+- The QA battery's lost-update `info` probe measures client-side read-modify-write via
+  `PutItem` (inherently last-writer-wins); the engine's atomic alternative,
+  `UpdateItem ... ADD`, reaches the exact count under concurrency (verified by the
+  battery's `update` suite). No engine change is appropriate there.
+
+### Tests
+- `features_live_test.py` extended with HTTP-layer checks (405 + `Allow`, `/health`,
+  Content-Type echo). External QA battery: 108 pass / 0 fail / 3 info (the 3 info lines
+  are observational `reporter.info` records, not assertions).
+
 ## [2.4.2] - 2026-06-07
 
 Closes the remaining open items from `CYNAMODB_IMPROVEMENT_PLAN.md` (round-4 deep

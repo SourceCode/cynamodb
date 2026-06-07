@@ -94,9 +94,16 @@ void HttpSession::on_read(beast::error_code ec, std::size_t bytes_transferred) {
 
 void HttpSession::handle_request() {
     http::response<http::string_body> res{http::status::ok, req_.version()};
-    res.set(http::field::server, "cynamoDB/2.4.2");
-    res.set(http::field::content_type, "application/x-amz-json-1.0");
-    
+    res.set(http::field::server, "cynamoDB/2.4.3");
+
+    // Echo the DynamoDB JSON protocol version the client used (1.0 or 1.1); default
+    // to 1.0. Input is otherwise content-type-lenient, matching AWS.
+    auto ct_view = req_[http::field::content_type];
+    const bool json_11 =
+        std::string_view(ct_view.data(), ct_view.size()).find("json-1.1") != std::string_view::npos;
+    res.set(http::field::content_type,
+            json_11 ? "application/x-amz-json-1.1" : "application/x-amz-json-1.0");
+
     // Request ID
     static thread_local std::mt19937 rng{std::random_device{}()};
     std::uniform_int_distribution<uint64_t> dist;
@@ -104,8 +111,21 @@ void HttpSession::handle_request() {
     snprintf(req_id, sizeof(req_id), "%016llx", static_cast<unsigned long long>(dist(rng)));
     res.set("x-amzn-RequestId", req_id);
 
-    if (req_.target() == "/health") {
+    const auto method = req_.method();
+    const bool is_health = req_.target() == "/health";
+
+    if (is_health && (method == http::verb::get || method == http::verb::head ||
+                      method == http::verb::post)) {
         res.body() = "{\"status\":\"healthy\"}";
+    } else if (method != http::verb::post) {
+        // The DynamoDB data plane only accepts POST; reject other methods cleanly
+        // with 405 instead of routing them through the operation dispatcher.
+        res.result(http::status::method_not_allowed);
+        res.set(http::field::allow, "POST");
+        res.set("x-amzn-ErrorType", "com.amazonaws.dynamodb.v20120810#UnknownOperationException");
+        res.body() = json::JsonSerializer::serialize_error(
+            "com.amazonaws.dynamodb.v20120810#UnknownOperationException",
+            "Only POST requests are supported by the cynamoDB endpoint");
     } else if (auto auth_err = check_auth(); auth_err.has_value()) {
         // Opt-in SigV4 enforcement rejected this request before dispatch.
         res.result(static_cast<http::status>(auth_err->status));

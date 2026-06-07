@@ -312,6 +312,38 @@ def test_error_shapes(client):
     check_eq(body, {}, "miss returns canonical {}")
 
 
+def test_http_layer(port):
+    print("  [http] method handling (405) and Content-Type protocol-version echo")
+    base = f"http://127.0.0.1:{port}/"
+
+    # GET / (wrong method) -> 405 Method Not Allowed with an Allow: POST header.
+    req = urllib.request.Request(base, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            status, allow = resp.status, resp.headers.get("Allow")
+    except urllib.error.HTTPError as e:
+        status, allow = e.code, e.headers.get("Allow")
+    check_eq(status, 405, "GET / returns 405")
+    check_eq(allow, "POST", "405 advertises Allow: POST")
+
+    # GET /health still works (health checks use GET).
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=10) as resp:
+        check_eq(resp.status, 200, "GET /health is 200")
+
+    # A request tagged x-amz-json-1.1 gets a 1.1 response Content-Type; default is 1.0.
+    def content_type_for(ct):
+        data = json.dumps({}).encode()
+        r = urllib.request.Request(base, data=data, method="POST", headers={
+            "X-Amz-Target": "DynamoDB_20120810.ListTables", "Content-Type": ct})
+        with urllib.request.urlopen(r, timeout=10) as resp:
+            return resp.status, resp.headers.get("Content-Type")
+    s11, ct11 = content_type_for("application/x-amz-json-1.1")
+    check_eq(s11, 200, "1.1 request succeeds")
+    check_eq(ct11, "application/x-amz-json-1.1", "response echoes json-1.1")
+    s10, ct10 = content_type_for("application/x-amz-json-1.0")
+    check_eq(ct10, "application/x-amz-json-1.0", "response defaults to json-1.0")
+
+
 def _sigv4_headers(access_key, secret_key, port, target, payload):
     """Produce a correct AWS SigV4 Authorization header (independent reference impl)."""
     import datetime
@@ -410,6 +442,7 @@ def main():
             test_batch_and_transactions(client)
             test_table_lifecycle(client)
             test_error_shapes(client)
+            test_http_layer(port)
         finally:
             server.stop()
 
