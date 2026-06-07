@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <iostream>
 #include <variant>
 
 namespace cynamodb::engine::lsm {
@@ -234,16 +235,25 @@ std::shared_ptr<AttributeValue> decode_attribute_value(std::string_view data) {
 }
 
 std::optional<RecordAttributes> decode_attributes(std::string_view data) {
+    // A decode failure means a durably-written record cannot be read back — a
+    // corruption event. Rather than silently dropping the row, surface it on stderr
+    // (with the count/offset) so it is observable in logs and tests; the caller
+    // still treats it as a hard failure (nullopt) since a partial record is unsafe.
+    auto corrupt = [&](const char* where, size_t pos) -> std::optional<RecordAttributes> {
+        std::cerr << "record_codec: corrupt record (" << where << ") at offset " << pos
+                  << " of " << data.size() << " bytes; record dropped" << std::endl;
+        return std::nullopt;
+    };
     Reader r{data, 0};
     uint32_t count = 0;
-    if (!r.read_u32(count)) return std::nullopt;
+    if (!r.read_u32(count)) return corrupt("count", r.pos);
     RecordAttributes attrs;
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t nl = 0;
         std::string_view name;
-        if (!r.read_u32(nl) || !r.read_bytes(nl, name)) return std::nullopt;
+        if (!r.read_u32(nl) || !r.read_bytes(nl, name)) return corrupt("attribute-name", r.pos);
         auto v = decode_value(r);
-        if (!v) return std::nullopt;
+        if (!v) return corrupt("attribute-value", r.pos);
         attrs[std::string(name)] = std::move(v);
     }
     return attrs;

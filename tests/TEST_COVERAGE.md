@@ -85,6 +85,23 @@ UndefinedBehaviorSanitizer (`-fno-sanitize-recover=all`).
 - **Auth** — DONE (presence/shape only at the time; superseded by v2.4.0 full SigV4).
 - **501 vs UnknownOperation** and **empty-key rejection** — DONE, with tests.
 
+## Addressed in v2.4.1 (from CYNAMODB_HARDCORE_QA.md / CYNAMODB_IMPROVEMENT_PLAN.md)
+
+- **CS-3 numeric & set validation** (`test_qa_hardening.cpp`): `N`/`NS` values must
+  match the DynamoDB number grammar (≤38 significant digits), validated recursively
+  inside `M`/`L`; sets must be non-empty and free of duplicate members.
+- **CS-10 single sizing source** (`core/sizing.hpp`): the item validator and JSON
+  serializer now share one `attribute_size`; the serializer no longer returns 0 for
+  non-scalar types (asserted equal in `test_qa_hardening.cpp`).
+- **CS-11 observable corruption**: a record that fails to decode is logged with its
+  offset and returns `nullopt` (never a silently-shortened item); regression test
+  truncates an encoded record and asserts a hard failure.
+- **CS-1b**: `JsonWriter::write` emits base64 for `B`/`BS`, matching the serializer.
+- **End-to-end QA battery**: the external `task-tester` battery (`server/qa/`, 75
+  checks across durability/concurrency/compaction/types/limits/pagination/protocol)
+  reports **0 failures** against the v2.4.1 binary — all 11 attribute types are
+  `ok` across memtable→flush→restart, and non-numeric `N`/empty keys are rejected.
+
 ## Addressed in v2.4.0
 
 - **Full SigV4 verification** (`test_sigv4_crypto.cpp`): SHA-256/HMAC KATs, the AWS

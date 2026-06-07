@@ -794,6 +794,18 @@ ApiResult handle_put_item(engine::TableManager& tables, engine::StorageEngine& s
             return error(400, "ValidationException",
                          "One or more parameter values were invalid: An AttributeValue may not contain an empty string for key attribute");
         }
+        if (valid.error() == engine::ValidationError::InvalidNumber) {
+            return error(400, "ValidationException",
+                         "The parameter cannot be converted to a numeric value");
+        }
+        if (valid.error() == engine::ValidationError::EmptySet) {
+            return error(400, "ValidationException",
+                         "One or more parameter values were invalid: An attribute value of type set must not be empty");
+        }
+        if (valid.error() == engine::ValidationError::DuplicateSetValue) {
+            return error(400, "ValidationException",
+                         "One or more parameter values were invalid: Input collection contains duplicates");
+        }
         return error(400, "ValidationException", "Item failed validation");
     }
 

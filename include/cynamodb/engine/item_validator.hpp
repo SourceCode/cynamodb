@@ -14,6 +14,9 @@ enum class ValidationError {
     NestingDepthExceeded,
     TypeMismatchForKey,
     EmptyKeyAttribute,
+    InvalidNumber,
+    EmptySet,
+    DuplicateSetValue,
     ProvisionedThroughputExceeded
 };
 

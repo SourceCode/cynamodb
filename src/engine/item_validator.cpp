@@ -1,72 +1,59 @@
 #include <cynamodb/engine/item_validator.hpp>
+#include <cynamodb/core/sizing.hpp>
 #include <algorithm>
+#include <cctype>
 #include <limits>
+#include <set>
 
 namespace cynamodb::engine {
 
 namespace {
 
-size_t saturating_add(size_t a, size_t b) {
-    if (std::numeric_limits<size_t>::max() - a < b) return std::numeric_limits<size_t>::max();
-    return a + b;
-}
+// Validates a string against DynamoDB's number grammar: optional sign, an integer
+// and/or fraction part with at least one digit, an optional exponent, and at most
+// 38 significant digits. Used to reject garbage stored as N/NS (which would also
+// corrupt the order-preserving numeric key codec).
+bool is_valid_number(std::string_view s) {
+    size_t i = 0;
+    const size_t n = s.size();
+    if (n == 0) return false;
+    if (s[i] == '+' || s[i] == '-') ++i;
 
-size_t calculate_attr_size(const core::AttributeValue& val) {
-    switch (val.type) {
-        case core::AttributeType::S:
-            return std::get<core::String>(val.value).size();
-        case core::AttributeType::N:
-            return std::get<core::String>(val.value).size();
-        case core::AttributeType::B:
-            return std::get<std::pmr::vector<uint8_t>>(val.value).size();
-        case core::AttributeType::BOOL:
-        case core::AttributeType::NUL:
-            return 1;
-        case core::AttributeType::M: {
-            size_t s = 3; // Overhead
-            for (const auto& [k, v] : std::get<core::MapValue>(val.value)) {
-                s = saturating_add(s, k.size());
-                s = saturating_add(s, calculate_attr_size(*v));
-                s = saturating_add(s, 1); // overhead per entry
-            }
-            return s;
-        }
-        case core::AttributeType::L: {
-            size_t s = 3;
-            for (const auto& v : std::get<core::ListValue>(val.value)) {
-                s = saturating_add(s, calculate_attr_size(*v));
-                s = saturating_add(s, 1);
-            }
-            return s;
-        }
-        case core::AttributeType::SS:
-        case core::AttributeType::NS: {
-            size_t s = 3;
-            const auto& vec = val.type == core::AttributeType::SS ? 
-                std::get<core::StringSet>(val.value).values : std::get<core::NumberSet>(val.value).values;
-            for (const auto& v : vec) {
-                s = saturating_add(s, v.size());
-            }
-            return s;
-        }
-        case core::AttributeType::BS: {
-            size_t s = 3;
-            for (const auto& v : std::get<core::BinarySet>(val.value).values) {
-                s = saturating_add(s, v.size());
-            }
-            return s;
-        }
+    size_t significant = 0;
+    bool any_digit = false;
+    bool seen_nonzero = false;
+    auto count_digit = [&](char c) {
+        any_digit = true;
+        if (c != '0' || seen_nonzero) { seen_nonzero = true; ++significant; }
+    };
+
+    while (i < n && std::isdigit(static_cast<unsigned char>(s[i]))) count_digit(s[i++]);
+    if (i < n && s[i] == '.') {
+        ++i;
+        while (i < n && std::isdigit(static_cast<unsigned char>(s[i]))) count_digit(s[i++]);
     }
-    return 0;
+    if (!any_digit) return false;
+
+    if (i < n && (s[i] == 'e' || s[i] == 'E')) {
+        ++i;
+        if (i < n && (s[i] == '+' || s[i] == '-')) ++i;
+        size_t exp_digits = 0;
+        while (i < n && std::isdigit(static_cast<unsigned char>(s[i]))) { ++i; ++exp_digits; }
+        if (exp_digits == 0) return false;
+    }
+    if (i != n) return false;             // trailing junk
+    return significant <= 38;
 }
 
 } // namespace
 
 size_t ItemValidator::calculate_item_size(const StorageEngine::AttributeMap& item) {
+    // Sizing delegates to the shared core implementation (see core/sizing.hpp) so
+    // the validator and the JSON serializer can never disagree.
     size_t size = 0;
     for (const auto& [k, v] : item) {
-        size = saturating_add(size, k.size());
-        if (v) size = saturating_add(size, calculate_attr_size(*v));
+        size = core::size_saturating_add(size, k.size());
+        if (v) size = core::size_saturating_add(size, core::attribute_size(*v));
     }
     return size;
 }
@@ -80,7 +67,39 @@ std::expected<void, ValidationError> ItemValidator::validate_attribute(
     if (name.size() > kMaxAttributeNameBytes) return std::unexpected(ValidationError::InvalidAttributeName);
     if (!val) return {};
 
-    if (val->type == core::AttributeType::M) {
+    if (val->type == core::AttributeType::N) {
+        if (!is_valid_number(std::get<core::String>(val->value))) {
+            return std::unexpected(ValidationError::InvalidNumber);
+        }
+    } else if (val->type == core::AttributeType::NS) {
+        const auto& vals = std::get<core::NumberSet>(val->value).values;
+        if (vals.empty()) return std::unexpected(ValidationError::EmptySet);
+        std::set<std::string_view> seen;
+        for (const auto& v : vals) {
+            if (!is_valid_number(v)) return std::unexpected(ValidationError::InvalidNumber);
+            if (!seen.insert(std::string_view(v.data(), v.size())).second) {
+                return std::unexpected(ValidationError::DuplicateSetValue);
+            }
+        }
+    } else if (val->type == core::AttributeType::SS) {
+        const auto& vals = std::get<core::StringSet>(val->value).values;
+        if (vals.empty()) return std::unexpected(ValidationError::EmptySet);
+        std::set<std::string_view> seen;
+        for (const auto& v : vals) {
+            if (!seen.insert(std::string_view(v.data(), v.size())).second) {
+                return std::unexpected(ValidationError::DuplicateSetValue);
+            }
+        }
+    } else if (val->type == core::AttributeType::BS) {
+        const auto& vals = std::get<core::BinarySet>(val->value).values;
+        if (vals.empty()) return std::unexpected(ValidationError::EmptySet);
+        std::set<std::vector<uint8_t>> seen;
+        for (const auto& v : vals) {
+            if (!seen.insert(std::vector<uint8_t>(v.begin(), v.end())).second) {
+                return std::unexpected(ValidationError::DuplicateSetValue);
+            }
+        }
+    } else if (val->type == core::AttributeType::M) {
         for (const auto& [k, v] : std::get<core::MapValue>(val->value)) {
             auto res = validate_attribute(k, v, depth + 1);
             if (!res) return res;

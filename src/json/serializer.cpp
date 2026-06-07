@@ -1,5 +1,6 @@
 #include <cynamodb/json/serializer.hpp>
 #include <cynamodb/utils/base64.hpp>
+#include <cynamodb/core/sizing.hpp>
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -37,11 +38,6 @@ core::String escape_json(std::string_view input) {
         }
     }
     return out;
-}
-
-size_t saturating_add(size_t a, size_t b) {
-    if (std::numeric_limits<size_t>::max() - a < b) return std::numeric_limits<size_t>::max();
-    return a + b;
 }
 
 } // namespace
@@ -344,16 +340,16 @@ std::string JsonSerializer::serialize_error(const std::string& type, const std::
 size_t JsonSerializer::calculate_item_size(const std::map<std::string, std::shared_ptr<core::AttributeValue>, core::StringViewLess>& item) {
     size_t size = 0;
     for (const auto& [k, v] : item) {
-        size = saturating_add(size, k.size());
-        if (v) size = saturating_add(size, calculate_attr_size(*v));
+        size = core::size_saturating_add(size, k.size());
+        if (v) size = core::size_saturating_add(size, core::attribute_size(*v));
     }
     return size;
 }
 
 size_t JsonSerializer::calculate_attr_size(const core::AttributeValue& val) {
-    if (val.type == core::AttributeType::S || val.type == core::AttributeType::N) return std::get<core::String>(val.value).size();
-    if (val.type == core::AttributeType::BOOL || val.type == core::AttributeType::NUL) return 1;
-    return 0;
+    // Delegates to the shared sizing in core/sizing.hpp (previously this returned 0
+    // for every non-scalar type, diverging from the item validator).
+    return core::attribute_size(val);
 }
 
 } // namespace cynamodb::json

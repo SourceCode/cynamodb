@@ -1,5 +1,7 @@
 #include <cynamodb/json/serializer.hpp>
+#include <cynamodb/utils/base64.hpp>
 #include <charconv>
+#include <string>
 #include <variant>
 
 namespace cynamodb::json {
@@ -104,7 +106,8 @@ std::expected<void, SerializationError> JsonWriter::write(const core::AttributeV
         case core::AttributeType::B: {
             const auto& b = std::get<std::pmr::vector<uint8_t>>(val.value);
             if (auto r = write_raw("\"B\":"); !r) return r;
-            if (auto r = write_string(std::string_view(reinterpret_cast<const char*>(b.data()), b.size())); !r) return r;
+            const std::string enc = utils::base64_encode_bytes(b);  // wire format is base64
+            if (auto r = write_string(enc); !r) return r;
             break;
         }
         case core::AttributeType::SS: {
@@ -138,7 +141,8 @@ std::expected<void, SerializationError> JsonWriter::write(const core::AttributeV
                 if (i > 0) {
                     if (auto r = write_char(','); !r) return r;
                 }
-                if (auto r = write_string(std::string_view(reinterpret_cast<const char*>(bs.values[i].data()), bs.values[i].size())); !r) return r;
+                const std::string enc = utils::base64_encode_bytes(bs.values[i]);  // wire format is base64
+                if (auto r = write_string(enc); !r) return r;
             }
             if (auto r = write_char(']'); !r) return r;
             break;

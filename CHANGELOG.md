@@ -4,6 +4,31 @@ All notable changes to cynamoDB are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/) and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [2.4.1] - 2026-06-06
+
+Hardening pass driven by `CYNAMODB_HARDCORE_QA.md` and `CYNAMODB_IMPROVEMENT_PLAN.md`.
+The external QA battery (`task-tester/server/qa`, 75 checks) now reports **0 failures**
+against this build (previously 9), with all 11 attribute types `ok` across
+memtable→flush→restart.
+
+### Added / Fixed
+- **CS-3 — numeric & set validation.** `N`/`NS` values are validated against the
+  DynamoDB number grammar (≤38 significant digits) and rejected with
+  `ValidationException` otherwise — recursively inside `M`/`L` too. Sets (`SS`/`NS`/`BS`)
+  must be non-empty and free of duplicate members. Previously garbage like
+  `{"N":"not-a-number"}` was stored verbatim.
+- **CS-10 — one sizing implementation.** The item validator and JSON serializer now
+  share `core::attribute_size` (`core/sizing.hpp`); the serializer previously returned
+  `0` for every non-scalar type, diverging from the validator.
+- **CS-11 — observable corruption.** A record that fails to decode is now logged with
+  its offset and returns a hard failure instead of silently dropping the row.
+- **CS-1b.** `JsonWriter::write` emits base64 for `B`/`BS`, matching the serializer.
+
+### Tests
+- New `test_qa_hardening.cpp` (numeric/set validation, sizing agreement, truncated-record
+  decode). 142 unit cases + 5 integration groups, green under ASan + UBSan; the external
+  QA battery passes with 0 failures.
+
 ## [2.4.0] - 2026-06-06
 
 This release closes the remaining limitations from the v2.3.0 compliance matrix:
