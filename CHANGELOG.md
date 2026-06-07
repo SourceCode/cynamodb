@@ -4,6 +4,30 @@ All notable changes to cynamoDB are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/) and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [2.4.2] - 2026-06-07
+
+Closes the remaining open items from `CYNAMODB_IMPROVEMENT_PLAN.md` (round-4 deep
+sweep): the full external QA battery (111 checks, 11 suites) now reports **0 failures**.
+
+### Added / Fixed
+- **CS-15 — parallel scan.** `Scan` now honors `Segment`/`TotalSegments`: each segment
+  returns a deterministic, non-overlapping partition of the table (keys hashed into
+  `TotalSegments` buckets), so the union of all segments is exactly one full scan with no
+  overlap. Honors `Limit` with a resumable per-segment cursor; mismatched or out-of-range
+  `Segment`/`TotalSegments` are rejected with `ValidationException`. (Previously every
+  segment silently returned the whole table.)
+- **CS-17 — request-size limits.** `BatchWriteItem` (≤25), `BatchGetItem` (≤100),
+  `TransactWriteItems`/`TransactGetItems` (≤100) now reject oversized requests with
+  `ValidationException` instead of accepting them.
+- **CS-14 — number normalization.** `N`/`NS` values are canonicalized on the write path
+  (`1.0`→`1`, `+5`→`5`, `-0`→`0`, `1.50`→`1.5`, `007`→`7`, `1e2`→`100`), so numeric values
+  are representation-independent, while 38-digit precision is preserved.
+
+### Tests
+- New `test_qa_round4.cpp` (normalization, parallel-scan tiling + pagination, batch/txn
+  caps). 148 unit cases + 5 integration groups, green under ASan + UBSan; external QA
+  battery passes 0-fail.
+
 ## [2.4.1] - 2026-06-06
 
 Hardening pass driven by `CYNAMODB_HARDCORE_QA.md` and `CYNAMODB_IMPROVEMENT_PLAN.md`.

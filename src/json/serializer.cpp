@@ -40,6 +40,69 @@ core::String escape_json(std::string_view input) {
     return out;
 }
 
+// Canonicalizes a DynamoDB number string (1.0 -> 1, +5 -> 5, -0 -> 0, 1.50 -> 1.5,
+// 007 -> 7), so numeric values are representation-independent on the wire. Returns
+// the input unchanged if it does not parse as a number, leaving it for the item
+// validator to reject.
+std::string normalize_number(std::string_view s) {
+    size_t i = 0;
+    const size_t n = s.size();
+    if (n == 0) return std::string(s);
+    bool neg = false;
+    if (s[i] == '+') ++i;
+    else if (s[i] == '-') { neg = true; ++i; }
+
+    std::string int_digits;
+    std::string frac_digits;
+    while (i < n && std::isdigit(static_cast<unsigned char>(s[i]))) int_digits.push_back(s[i++]);
+    if (i < n && s[i] == '.') {
+        ++i;
+        while (i < n && std::isdigit(static_cast<unsigned char>(s[i]))) frac_digits.push_back(s[i++]);
+    }
+    if (int_digits.empty() && frac_digits.empty()) return std::string(s);
+
+    long long exp = 0;
+    if (i < n && (s[i] == 'e' || s[i] == 'E')) {
+        ++i;
+        bool eneg = false;
+        if (i < n && (s[i] == '+' || s[i] == '-')) { eneg = (s[i] == '-'); ++i; }
+        std::string ed;
+        while (i < n && std::isdigit(static_cast<unsigned char>(s[i]))) ed.push_back(s[i++]);
+        if (ed.empty()) return std::string(s);
+        for (char c : ed) { exp = exp * 10 + (c - '0'); if (exp > 100000) break; }
+        if (eneg) exp = -exp;
+    }
+    if (i != n) return std::string(s);  // trailing junk -> not a number
+
+    std::string digits = int_digits + frac_digits;       // full mantissa
+    long long pexp = exp - static_cast<long long>(frac_digits.size());
+
+    size_t lead = 0;
+    while (lead + 1 < digits.size() && digits[lead] == '0') ++lead;
+    digits = digits.substr(lead);
+    if (digits.find_first_not_of('0') == std::string::npos) return "0";  // zero in any form
+    while (digits.size() > 1 && digits.back() == '0') { digits.pop_back(); ++pexp; }
+
+    const long long nd = static_cast<long long>(digits.size());
+    const long long point_pos = nd + pexp;  // digits before the decimal point
+    constexpr long long kMaxPlain = 40;
+    std::string body;
+    if (pexp >= 0) {
+        if (pexp <= kMaxPlain) body = digits + std::string(static_cast<size_t>(pexp), '0');
+    } else if (point_pos > 0) {
+        body = digits.substr(0, static_cast<size_t>(point_pos)) + "." + digits.substr(static_cast<size_t>(point_pos));
+    } else if (-point_pos <= kMaxPlain) {
+        body = "0." + std::string(static_cast<size_t>(-point_pos), '0') + digits;
+    }
+    if (body.empty()) {  // extreme magnitude: canonical scientific form
+        const long long adj = point_pos - 1;
+        body = digits.substr(0, 1);
+        if (digits.size() > 1) body += "." + digits.substr(1);
+        body += "E" + std::string(adj >= 0 ? "+" : "") + std::to_string(adj);
+    }
+    return (neg ? "-" : "") + body;
+}
+
 } // namespace
 
 core::AttributeValue JsonParser::parse_attribute_value(simdjson::dom::element el) {
@@ -50,7 +113,11 @@ core::AttributeValue JsonParser::parse_attribute_value(simdjson::dom::element el
     auto it = obj.begin();
     std::string_view key = it.key();
     if (key == "S") { val.type = core::AttributeType::S; val.value = core::String(it.value().get_string().value()); }
-    else if (key == "N") { val.type = core::AttributeType::N; val.value = core::String(it.value().get_string().value()); }
+    else if (key == "N") {
+        val.type = core::AttributeType::N;
+        std::string norm = normalize_number(it.value().get_string().value());
+        val.value = core::String(norm.data(), norm.size());
+    }
     else if (key == "BOOL") { val.type = core::AttributeType::BOOL; val.value = it.value().get_bool().value(); }
     else if (key == "NULL") { val.type = core::AttributeType::NUL; val.value = std::monostate{}; }
     else if (key == "M") {
@@ -87,7 +154,8 @@ core::AttributeValue JsonParser::parse_attribute_value(simdjson::dom::element el
         val.type = core::AttributeType::NS;
         core::NumberSet set;
         for (auto elem : it.value().get_array()) {
-            set.values.push_back(core::String(elem.get_string().value()));
+            std::string norm = normalize_number(elem.get_string().value());
+            set.values.push_back(core::String(norm.data(), norm.size()));
         }
         val.value = std::move(set);
     }

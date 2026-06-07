@@ -1044,6 +1044,14 @@ ApiResult handle_update_item(engine::TableManager& tables, engine::StorageEngine
     return ok("{}");
 }
 
+// Stable 64-bit FNV-1a, used to deterministically assign an item to a parallel-scan
+// segment by hashing its storage key.
+uint64_t fnv1a(std::string_view s) {
+    uint64_t h = 1469598103934665603ULL;
+    for (unsigned char c : s) { h ^= c; h *= 1099511628211ULL; }
+    return h;
+}
+
 ApiResult handle_scan(engine::TableManager& tables, engine::StorageEngine& storage,
                       simdjson::dom::element doc) {
     std::string_view name;
@@ -1069,6 +1077,25 @@ ApiResult handle_scan(engine::TableManager& tables, engine::StorageEngine& stora
         scan_table = index_storage_table(std::string(name), std::string(index_name));
     }
 
+    // Parallel scan: Segment + TotalSegments must be supplied together.
+    int64_t segment = 0;
+    int64_t total_segments = 0;
+    const bool has_segment = doc["Segment"].get_int64().get(segment) == simdjson::SUCCESS;
+    const bool has_total = doc["TotalSegments"].get_int64().get(total_segments) == simdjson::SUCCESS;
+    if (has_segment != has_total) {
+        return error(400, "ValidationException",
+                     "The Segment and TotalSegments parameters must be provided together");
+    }
+    const bool segmented = has_segment && has_total;
+    if (segmented) {
+        if (total_segments < 1 || total_segments > 1000000) {
+            return error(400, "ValidationException", "TotalSegments must be between 1 and 1000000");
+        }
+        if (segment < 0 || segment >= total_segments) {
+            return error(400, "ValidationException", "Segment must be between 0 and TotalSegments-1");
+        }
+    }
+
     size_t limit = read_limit(doc).value_or(0);
     std::optional<std::string> start;
     if (idx) {
@@ -1079,7 +1106,6 @@ ApiResult handle_scan(engine::TableManager& tables, engine::StorageEngine& stora
     } else {
         start = read_start_key(doc, *def);
     }
-    auto result = storage.scan(scan_table, start, limit);
 
     std::string_view filter_view;
     const bool has_filter = doc["FilterExpression"].get_string().get(filter_view) == simdjson::SUCCESS;
@@ -1090,8 +1116,33 @@ ApiResult handle_scan(engine::TableManager& tables, engine::StorageEngine& stora
     auto values_opt = parse_expr_values(doc);
     if (!values_opt) return error(400, "ValidationException", "Invalid ExpressionAttributeValues");
 
+    auto storage_key = [&](const AttributeMap& item) {
+        return idx ? encode_index_storage_key(*idx, *def, item) : engine::encode_primary_key(*def, item);
+    };
+    auto lek_json = [&](const AttributeMap& item) {
+        return idx ? index_key_only_json(*idx, *def, item) : key_only_json(*def, item);
+    };
+
     std::vector<AttributeMap> output;
-    for (const auto& item : result.items) {
+    size_t scanned = 0;
+    std::optional<std::string> last_evaluated;
+    std::optional<std::string> last_scanned;  // key of the most recently scanned segment item
+
+    // Segmented and non-segmented share one evaluation loop. For a segmented scan the
+    // whole namespace is fetched and only the segment's keys are evaluated (pagination
+    // is applied in-handler); otherwise the storage layer applies the limit/cursor.
+    auto page = storage.scan(scan_table, start, segmented ? 0 : limit);
+    for (const auto& item : page.items) {
+        if (segmented && (fnv1a(storage_key(item)) % static_cast<uint64_t>(total_segments)) !=
+                             static_cast<uint64_t>(segment)) {
+            continue;  // not this segment
+        }
+        if (segmented && limit != 0 && scanned == limit) {
+            last_evaluated = last_scanned;  // resume after the last item we actually scanned
+            break;
+        }
+        ++scanned;
+        last_scanned = lek_json(item);
         if (!idx && item_is_expired(*def, item)) continue;  // TTL applies to base-table scans
         if (has_filter) {
             int r = evaluate_boolean_expr(filter, item, names, *values_opt);
@@ -1108,14 +1159,15 @@ ApiResult handle_scan(engine::TableManager& tables, engine::StorageEngine& stora
             output.push_back(item);
         }
     }
+    if (!segmented) {
+        scanned = page.items.size();
+        if (page.last_evaluated_key && !page.items.empty()) last_evaluated = lek_json(page.items.back());
+    }
 
     std::string out = "{\"Items\":" + items_to_json(output) +
                       ",\"Count\":" + std::to_string(output.size()) +
-                      ",\"ScannedCount\":" + std::to_string(result.items.size());
-    if (result.last_evaluated_key && !result.items.empty()) {
-        out += ",\"LastEvaluatedKey\":" +
-               (idx ? index_key_only_json(*idx, *def, result.items.back()) : key_only_json(*def, result.items.back()));
-    }
+                      ",\"ScannedCount\":" + std::to_string(scanned);
+    if (last_evaluated) out += ",\"LastEvaluatedKey\":" + *last_evaluated;
     out += "}";
     return ok(std::move(out));
 }
@@ -1413,6 +1465,10 @@ ApiResult handle_batch_write_item(engine::TableManager& tables, engine::StorageE
             }
         }
     }
+    if (ops.size() > 25) {
+        return error(400, "ValidationException",
+                     "Too many items requested for the BatchWriteItem call");
+    }
     for (auto& op : ops) {
         auto def = tables.describe_table(op.table);
         const bool has_idx = def && (!def->global_secondary_indexes.empty() ||
@@ -1440,6 +1496,18 @@ ApiResult handle_batch_get_item(engine::TableManager& tables, engine::StorageEng
     simdjson::dom::object request_items;
     if (doc["RequestItems"].get_object().get(request_items) != simdjson::SUCCESS) {
         return error(400, "ValidationException", "RequestItems is required");
+    }
+    // Enforce the AWS cap of 100 keys per BatchGetItem call (across all tables).
+    size_t total_keys = 0;
+    for (auto table_field : request_items) {
+        simdjson::dom::array keys;
+        if (table_field.value["Keys"].get_array().get(keys) == simdjson::SUCCESS) {
+            total_keys += keys.size();
+        }
+    }
+    if (total_keys > 100) {
+        return error(400, "ValidationException",
+                     "Too many items requested for the BatchGetItem call");
     }
     std::string responses = "{";
     bool first_table = true;
@@ -1476,6 +1544,10 @@ ApiResult handle_transact_write_items(engine::TableManager& tables, engine::Stor
     simdjson::dom::array transact_items;
     if (doc["TransactItems"].get_array().get(transact_items) != simdjson::SUCCESS) {
         return error(400, "ValidationException", "TransactItems is required");
+    }
+    if (transact_items.size() > 100) {
+        return error(400, "ValidationException",
+                     "Member must have length less than or equal to 100 (TransactWriteItems)");
     }
     // Two-phase: validate keys/conditions, then apply. Conditions are checked
     // against a current snapshot so the all-or-nothing contract holds for the
@@ -1625,6 +1697,10 @@ ApiResult handle_transact_get_items(engine::TableManager& tables, engine::Storag
     simdjson::dom::array transact_items;
     if (doc["TransactItems"].get_array().get(transact_items) != simdjson::SUCCESS) {
         return error(400, "ValidationException", "TransactItems is required");
+    }
+    if (transact_items.size() > 100) {
+        return error(400, "ValidationException",
+                     "Member must have length less than or equal to 100 (TransactGetItems)");
     }
     std::string responses = "[";
     bool first = true;

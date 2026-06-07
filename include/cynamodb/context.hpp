@@ -1,7 +1,7 @@
 /**
  * @file context.hpp
  * @brief Core execution context for cynamoDB.
- * @version 2.4.1
+ * @version 2.4.2
  */
 
 #pragma once

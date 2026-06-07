@@ -85,6 +85,20 @@ UndefinedBehaviorSanitizer (`-fno-sanitize-recover=all`).
 - **Auth** — DONE (presence/shape only at the time; superseded by v2.4.0 full SigV4).
 - **501 vs UnknownOperation** and **empty-key rejection** — DONE, with tests.
 
+## Addressed in v2.4.2 (CYNAMODB_IMPROVEMENT_PLAN.md round 4)
+
+- **CS-14 number normalization** (`test_qa_round4.cpp`): `N`/`NS` values are
+  canonicalized on write (`1.0`→`1`, `+5`→`5`, `-0`→`0`, `1.50`→`1.5`, `007`→`7`,
+  `1e2`→`100`, `1.5e-3`→`0.0015`), preserving 38-digit precision.
+- **CS-15 parallel scan** (`test_qa_round4.cpp`): `Scan` honors `Segment`/
+  `TotalSegments` — segments tile the table exactly (no overlap, full union) and
+  honor `Limit` with a resumable cursor; mismatched/out-of-range params are rejected.
+- **CS-17 batch/transaction caps** (`test_qa_round4.cpp`): `BatchWriteItem` ≤25,
+  `BatchGetItem` ≤100, `TransactWriteItems`/`TransactGetItems` ≤100; over-limit →
+  `ValidationException`.
+- **External QA battery**: the full 11-suite battery (111 checks incl. the round-4
+  `update`/`txn`/`query2`/`gsi` suites) reports **0 failures** against the v2.4.2 binary.
+
 ## Addressed in v2.4.1 (from CYNAMODB_HARDCORE_QA.md / CYNAMODB_IMPROVEMENT_PLAN.md)
 
 - **CS-3 numeric & set validation** (`test_qa_hardening.cpp`): `N`/`NS` values must

@@ -94,7 +94,7 @@ void HttpSession::on_read(beast::error_code ec, std::size_t bytes_transferred) {
 
 void HttpSession::handle_request() {
     http::response<http::string_body> res{http::status::ok, req_.version()};
-    res.set(http::field::server, "cynamoDB/2.4.1");
+    res.set(http::field::server, "cynamoDB/2.4.2");
     res.set(http::field::content_type, "application/x-amz-json-1.0");
     
     // Request ID

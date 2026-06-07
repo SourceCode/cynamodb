@@ -47,7 +47,7 @@ recognized-but-unimplemented operations return `501 NotImplementedException`.
 | `UpdateItem` | `UpdateExpression` (`SET`/`REMOVE`/`ADD`/`DELETE`, `+`/`-`, `if_not_exists`, `list_append`); `ConditionExpression`; `ReturnValues`. |
 | `DeleteItem` | `ConditionExpression`; `ReturnValues=ALL_OLD`. |
 | `Query` | `KeyConditionExpression` (and legacy `KeyConditions`); sort-key `=,<,<=,>,>=,BETWEEN,begins_with`; `FilterExpression`; `ProjectionExpression`; `ScanIndexForward`; `Limit`/`ExclusiveStartKey`. |
-| `Scan` | `FilterExpression`; `ProjectionExpression`; `Limit`/`ExclusiveStartKey`. |
+| `Scan` | `FilterExpression`; `ProjectionExpression`; `Limit`/`ExclusiveStartKey`; parallel scan via `Segment`/`TotalSegments`. |
 | `BatchGetItem` / `BatchWriteItem` | Fan-out across tables; validated before any write. |
 | `TransactWriteItems` | `Put`/`Delete`/`Update`/`ConditionCheck`, all-or-nothing (conditions + updates validated before any write). |
 | `TransactGetItems` | — |
@@ -80,7 +80,10 @@ A genuinely unknown `X-Amz-Target` (not in the dispatcher) returns
   source table's **current** state.
 - **Global tables** model the single node as a one-replica (`ddblocal`) global table.
 - **Numeric sort keys** use a `double` ordering codec (exact ordering to 2⁵³); the stored
-  `N` attribute value itself round-trips exactly at any precision.
+  `N` attribute value itself round-trips exactly at any precision and is canonicalized
+  on write (`1.0`→`1`, `007`→`7`).
+- **Batch/transaction caps** match AWS: `BatchWriteItem` ≤25, `BatchGetItem` ≤100,
+  `TransactWriteItems`/`TransactGetItems` ≤100 items.
 
 ## Error Handling
 
