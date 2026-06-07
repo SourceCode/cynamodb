@@ -94,7 +94,7 @@ void HttpSession::on_read(beast::error_code ec, std::size_t bytes_transferred) {
 
 void HttpSession::handle_request() {
     http::response<http::string_body> res{http::status::ok, req_.version()};
-    res.set(http::field::server, "cynamoDB/2.4.3");
+    res.set(http::field::server, "cynamoDB/2.5.0");
 
     // Echo the DynamoDB JSON protocol version the client used (1.0 or 1.1); default
     // to 1.0. Input is otherwise content-type-lenient, matching AWS.

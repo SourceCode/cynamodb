@@ -85,6 +85,15 @@ UndefinedBehaviorSanitizer (`-fno-sanitize-recover=all`).
 - **Auth** — DONE (presence/shape only at the time; superseded by v2.4.0 full SigV4).
 - **501 vs UnknownOperation** and **empty-key rejection** — DONE, with tests.
 
+## Addressed in v2.5.0 (CYNAMODB_IMPROVEMENT_PLAN.md round 6)
+
+- **CS-18 `Select=COUNT`**, **CS-19 ConsistentRead-on-GSI rejection**,
+  **CS-20 duplicate transaction target rejection**, **CS-21 transaction idempotency
+  (`ClientRequestToken`)**, **CS-22 `UPDATED_NEW`/`UPDATED_OLD` changed-attrs-only** —
+  all covered by `test_qa_round6.cpp`.
+- External QA battery (18 suites / 165 checks incl. `querydeep`/`txndeep`/`rmwdeep`/
+  `occ`/`expr`): **0 failures** against the v2.5.0 binary.
+
 ## Addressed in v2.4.2 (CYNAMODB_IMPROVEMENT_PLAN.md round 4)
 
 - **CS-14 number normalization** (`test_qa_round4.cpp`): `N`/`NS` values are

@@ -46,10 +46,11 @@ recognized-but-unimplemented operations return `501 NotImplementedException`.
 | `GetItem` | `ProjectionExpression` (top-level attributes); a miss returns `{}`. |
 | `UpdateItem` | `UpdateExpression` (`SET`/`REMOVE`/`ADD`/`DELETE`, `+`/`-`, `if_not_exists`, `list_append`); `ConditionExpression`; `ReturnValues`. |
 | `DeleteItem` | `ConditionExpression`; `ReturnValues=ALL_OLD`. |
-| `Query` | `KeyConditionExpression` (and legacy `KeyConditions`); sort-key `=,<,<=,>,>=,BETWEEN,begins_with`; `FilterExpression`; `ProjectionExpression`; `ScanIndexForward`; `Limit`/`ExclusiveStartKey`. |
-| `Scan` | `FilterExpression`; `ProjectionExpression`; `Limit`/`ExclusiveStartKey`; parallel scan via `Segment`/`TotalSegments`. |
+| `Query` | `KeyConditionExpression` (and legacy `KeyConditions`); sort-key `=,<,<=,>,>=,BETWEEN,begins_with`; `FilterExpression`; `ProjectionExpression`; `ScanIndexForward`; `Select=COUNT`; `Limit`/`ExclusiveStartKey`. GSI `ConsistentRead` rejected. |
+| `Scan` | `FilterExpression`; `ProjectionExpression`; `Select=COUNT`; `Limit`/`ExclusiveStartKey`; parallel scan via `Segment`/`TotalSegments`. |
+| `UpdateItem` | also `ReturnValues=UPDATED_NEW`/`UPDATED_OLD` (changed attributes only). |
 | `BatchGetItem` / `BatchWriteItem` | Fan-out across tables; validated before any write. |
-| `TransactWriteItems` | `Put`/`Delete`/`Update`/`ConditionCheck`, all-or-nothing (conditions + updates validated before any write). |
+| `TransactWriteItems` | `Put`/`Delete`/`Update`/`ConditionCheck`, all-or-nothing (conditions + updates validated before any write); `ClientRequestToken` idempotency; duplicate-target rejection. |
 | `TransactGetItems` | — |
 | `UpdateTimeToLive` / `DescribeTimeToLive` | TTL spec persisted; expired items filtered from reads (lazy reaping). |
 | Secondary indexes | GSI/LSI parsed, maintained on every write, and queryable via `Query`/`Scan` with `IndexName` (projection types honored, sparse indexes). |

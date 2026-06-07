@@ -7,13 +7,18 @@
 #include <cynamodb/expressions/parser.hpp>
 #include <cynamodb/expressions/update_expression.hpp>
 #include <cynamodb/json/serializer.hpp>
+#include <cynamodb/utils/sha256.hpp>
 
 #include <simdjson.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <deque>
+#include <map>
+#include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -254,6 +259,13 @@ std::vector<IndexSpec> all_indexes(const core::TableDefinition& def) {
     return out;
 }
 
+bool index_is_gsi(const core::TableDefinition& def, std::string_view name) {
+    for (const auto& g : def.global_secondary_indexes) {
+        if (g.index_name == name) return true;
+    }
+    return false;
+}
+
 const IndexSpec* find_index(const std::vector<IndexSpec>& idxs, std::string_view name, IndexSpec& storage) {
     for (const auto& i : idxs) {
         if (i.name == name) { storage = i; return &storage; }
@@ -369,6 +381,23 @@ std::optional<size_t> read_limit(simdjson::dom::element doc) {
         return static_cast<size_t>(limit);
     }
     return std::nullopt;
+}
+
+// Interprets the Query/Scan `Select` parameter. Returns 1 for COUNT (response omits
+// Items), 0 for the default attribute-returning behavior, or -1 (with `msg`) when
+// Select is incompatible with ProjectionExpression.
+int read_select_count(simdjson::dom::element doc, bool has_projection, std::string& msg) {
+    std::string_view sel;
+    if (doc["Select"].get_string().get(sel) != simdjson::SUCCESS) return 0;
+    if (sel == "COUNT") {
+        if (has_projection) {
+            msg = "Cannot specify the ProjectionExpression parameter when the Select parameter "
+                  "is set to COUNT";
+            return -1;
+        }
+        return 1;
+    }
+    return 0;
 }
 
 // Returns the encoded exclusive-start-key token from the request, if present.
@@ -1035,11 +1064,35 @@ ApiResult handle_update_item(engine::TableManager& tables, engine::StorageEngine
     emit_stream(streams, *def, outcome.previous ? "MODIFY" : "INSERT", extract_keys(*def, new_item),
                 outcome.previous, new_item);
 
-    if (return_values == "ALL_NEW" || return_values == "UPDATED_NEW") {
+    if (return_values == "ALL_NEW") {
         return ok("{\"Attributes\":" + json::JsonSerializer::serialize_item(new_item) + "}");
     }
-    if ((return_values == "ALL_OLD" || return_values == "UPDATED_OLD") && outcome.previous) {
+    if (return_values == "ALL_OLD" && outcome.previous) {
         return ok("{\"Attributes\":" + json::JsonSerializer::serialize_item(*outcome.previous) + "}");
+    }
+    // UPDATED_NEW / UPDATED_OLD return only the attributes the update actually changed,
+    // not the whole item. Diff old vs new at the attribute level.
+    if (return_values == "UPDATED_NEW" || return_values == "UPDATED_OLD") {
+        AttributeMap old = outcome.previous ? *outcome.previous : AttributeMap{};
+        auto attr_eq = [](const std::shared_ptr<core::AttributeValue>& a,
+                          const std::shared_ptr<core::AttributeValue>& b) {
+            if (!a || !b) return a == b;
+            return json::JsonSerializer::serialize_attribute_value(*a) ==
+                   json::JsonSerializer::serialize_attribute_value(*b);
+        };
+        AttributeMap changed;
+        if (return_values == "UPDATED_NEW") {
+            for (const auto& [k, v] : new_item) {
+                auto it = old.find(k);
+                if (it == old.end() || !attr_eq(it->second, v)) changed[k] = v;  // added or modified
+            }
+        } else {  // UPDATED_OLD: old value of attributes that changed or were removed
+            for (const auto& [k, v] : old) {
+                auto it = new_item.find(k);
+                if (it == new_item.end() || !attr_eq(it->second, v)) changed[k] = v;
+            }
+        }
+        return ok("{\"Attributes\":" + json::JsonSerializer::serialize_item(changed) + "}");
     }
     return ok("{}");
 }
@@ -1112,6 +1165,10 @@ ApiResult handle_scan(engine::TableManager& tables, engine::StorageEngine& stora
     const std::string filter(filter_view);
     std::string_view projection_view;
     const bool has_projection = doc["ProjectionExpression"].get_string().get(projection_view) == simdjson::SUCCESS;
+    std::string select_msg;
+    const int select_count = read_select_count(doc, has_projection, select_msg);
+    if (select_count < 0) return error(400, "ValidationException", select_msg);
+    const bool count_only = select_count == 1;
     NameMap names = parse_expr_names(doc);
     auto values_opt = parse_expr_values(doc);
     if (!values_opt) return error(400, "ValidationException", "Invalid ExpressionAttributeValues");
@@ -1124,6 +1181,7 @@ ApiResult handle_scan(engine::TableManager& tables, engine::StorageEngine& stora
     };
 
     std::vector<AttributeMap> output;
+    size_t matched_count = 0;
     size_t scanned = 0;
     std::optional<std::string> last_evaluated;
     std::optional<std::string> last_scanned;  // key of the most recently scanned segment item
@@ -1149,6 +1207,8 @@ ApiResult handle_scan(engine::TableManager& tables, engine::StorageEngine& stora
             if (r < 0) return error(400, "ValidationException", "Invalid FilterExpression");
             if (r == 0) continue;
         }
+        ++matched_count;
+        if (count_only) continue;
         if (has_projection) {
             bool unsupported = false;
             AttributeMap projected = apply_projection(item, std::string(projection_view), names, unsupported);
@@ -1164,9 +1224,10 @@ ApiResult handle_scan(engine::TableManager& tables, engine::StorageEngine& stora
         if (page.last_evaluated_key && !page.items.empty()) last_evaluated = lek_json(page.items.back());
     }
 
-    std::string out = "{\"Items\":" + items_to_json(output) +
-                      ",\"Count\":" + std::to_string(output.size()) +
-                      ",\"ScannedCount\":" + std::to_string(scanned);
+    std::string out = "{";
+    if (!count_only) out += "\"Items\":" + items_to_json(output) + ",";
+    out += "\"Count\":" + std::to_string(matched_count) +
+           ",\"ScannedCount\":" + std::to_string(scanned);
     if (last_evaluated) out += ",\"LastEvaluatedKey\":" + *last_evaluated;
     out += "}";
     return ok(std::move(out));
@@ -1183,6 +1244,14 @@ ApiResult handle_index_query(engine::StorageEngine& storage,
     }
     if (idx->key_schema.empty()) {
         return error(400, "ValidationException", "Index has no key schema: " + index_name);
+    }
+
+    // GSIs are eventually consistent only; AWS rejects ConsistentRead on a GSI (LSIs allow it).
+    bool consistent = false;
+    if (doc["ConsistentRead"].get_bool().get(consistent) == simdjson::SUCCESS && consistent &&
+        index_is_gsi(def, index_name)) {
+        return error(400, "ValidationException",
+                     "Consistent reads are not supported on global secondary indexes");
     }
 
     NameMap names = parse_expr_names(doc);
@@ -1241,8 +1310,13 @@ ApiResult handle_index_query(engine::StorageEngine& storage,
     const std::string filter(filter_view);
     std::string_view projection_view;
     const bool has_projection = doc["ProjectionExpression"].get_string().get(projection_view) == simdjson::SUCCESS;
+    std::string select_msg;
+    const int select_count = read_select_count(doc, has_projection, select_msg);
+    if (select_count < 0) return error(400, "ValidationException", select_msg);
+    const bool count_only = select_count == 1;
 
     std::vector<AttributeMap> output;
+    size_t matched_count = 0;
     size_t examined = 0;
     std::optional<std::string> last_evaluated;
     for (size_t i = begin_idx; i < matched.size(); ++i) {
@@ -1257,6 +1331,8 @@ ApiResult handle_index_query(engine::StorageEngine& storage,
             if (r < 0) return error(400, "ValidationException", "Invalid FilterExpression");
             if (r == 0) continue;
         }
+        ++matched_count;
+        if (count_only) continue;
         if (has_projection) {
             bool unsupported = false;
             AttributeMap projected = apply_projection(item, std::string(projection_view), names, unsupported);
@@ -1267,9 +1343,10 @@ ApiResult handle_index_query(engine::StorageEngine& storage,
         }
     }
 
-    std::string out = "{\"Items\":" + items_to_json(output) +
-                      ",\"Count\":" + std::to_string(output.size()) +
-                      ",\"ScannedCount\":" + std::to_string(examined);
+    std::string out = "{";
+    if (!count_only) out += "\"Items\":" + items_to_json(output) + ",";
+    out += "\"Count\":" + std::to_string(matched_count) +
+           ",\"ScannedCount\":" + std::to_string(examined);
     if (last_evaluated) out += ",\"LastEvaluatedKey\":" + *last_evaluated;
     out += "}";
     return ok(std::move(out));
@@ -1376,8 +1453,13 @@ ApiResult handle_query(engine::TableManager& tables, engine::StorageEngine& stor
     const std::string filter(filter_view);
     std::string_view projection_view;
     const bool has_projection = doc["ProjectionExpression"].get_string().get(projection_view) == simdjson::SUCCESS;
+    std::string select_msg;
+    const int select_count = read_select_count(doc, has_projection, select_msg);
+    if (select_count < 0) return error(400, "ValidationException", select_msg);
+    const bool count_only = select_count == 1;
 
     std::vector<AttributeMap> output;
+    size_t matched_count = 0;
     size_t examined = 0;
     std::optional<std::string> last_evaluated;
     for (size_t i = begin_idx; i < matched.size(); ++i) {
@@ -1392,6 +1474,8 @@ ApiResult handle_query(engine::TableManager& tables, engine::StorageEngine& stor
             if (r < 0) return error(400, "ValidationException", "Invalid FilterExpression");
             if (r == 0) continue;
         }
+        ++matched_count;
+        if (count_only) continue;
         if (has_projection) {
             bool unsupported = false;
             AttributeMap projected = apply_projection(item, std::string(projection_view), names, unsupported);
@@ -1403,9 +1487,10 @@ ApiResult handle_query(engine::TableManager& tables, engine::StorageEngine& stor
         }
     }
 
-    std::string out = "{\"Items\":" + items_to_json(output) +
-                      ",\"Count\":" + std::to_string(output.size()) +
-                      ",\"ScannedCount\":" + std::to_string(examined);
+    std::string out = "{";
+    if (!count_only) out += "\"Items\":" + items_to_json(output) + ",";
+    out += "\"Count\":" + std::to_string(matched_count) +
+           ",\"ScannedCount\":" + std::to_string(examined);
     if (last_evaluated) {
         out += ",\"LastEvaluatedKey\":" + *last_evaluated;
     }
@@ -1539,8 +1624,51 @@ ApiResult handle_batch_get_item(engine::TableManager& tables, engine::StorageEng
     return ok("{\"Responses\":" + responses + ",\"UnprocessedKeys\":{}}");
 }
 
+// Bounded, time-limited cache of ClientRequestToken -> completed TransactWriteItems
+// outcome, so an SDK retry with the same token is applied at most once (AWS semantics).
+class IdempotencyCache {
+public:
+    // 0 = not cached (proceed), 1 = cached hit (out = response), 2 = token reused with a
+    // different request body.
+    int lookup(const std::string& token, const std::string& body_hash, std::string& out) {
+        std::lock_guard lk(mutex_);
+        auto it = entries_.find(token);
+        if (it == entries_.end()) return 0;
+        if (std::chrono::steady_clock::now() - it->second.at > kTtl) {
+            entries_.erase(it);
+            return 0;
+        }
+        if (it->second.body_hash != body_hash) return 2;
+        out = it->second.response;
+        return 1;
+    }
+    void store(const std::string& token, const std::string& body_hash, const std::string& response) {
+        std::lock_guard lk(mutex_);
+        if (entries_.find(token) == entries_.end()) order_.push_back(token);
+        entries_[token] = {body_hash, response, std::chrono::steady_clock::now()};
+        while (entries_.size() > kMax && !order_.empty()) {
+            entries_.erase(order_.front());
+            order_.pop_front();
+        }
+    }
+
+private:
+    struct Entry { std::string body_hash; std::string response; std::chrono::steady_clock::time_point at; };
+    static constexpr size_t kMax = 4096;
+    static constexpr std::chrono::minutes kTtl{10};
+    std::mutex mutex_;
+    std::map<std::string, Entry> entries_;
+    std::deque<std::string> order_;
+};
+
+IdempotencyCache& txn_idempotency() {
+    static IdempotencyCache cache;
+    return cache;
+}
+
 ApiResult handle_transact_write_items(engine::TableManager& tables, engine::StorageEngine& storage,
-                                      simdjson::dom::element doc, streams::StreamManager* streams) {
+                                      simdjson::dom::element doc, streams::StreamManager* streams,
+                                      std::string_view raw_body) {
     simdjson::dom::array transact_items;
     if (doc["TransactItems"].get_array().get(transact_items) != simdjson::SUCCESS) {
         return error(400, "ValidationException", "TransactItems is required");
@@ -1548,6 +1676,24 @@ ApiResult handle_transact_write_items(engine::TableManager& tables, engine::Stor
     if (transact_items.size() > 100) {
         return error(400, "ValidationException",
                      "Member must have length less than or equal to 100 (TransactWriteItems)");
+    }
+
+    // Idempotency: a retried transaction with the same ClientRequestToken is applied
+    // at most once; reusing a token with a different body is an error.
+    std::string_view token_view;
+    const bool has_token = doc["ClientRequestToken"].get_string().get(token_view) == simdjson::SUCCESS &&
+                           !token_view.empty();
+    const std::string token(token_view);
+    const std::string body_hash = has_token ? utils::sha256_hex(raw_body) : std::string();
+    if (has_token) {
+        std::string cached;
+        int r = txn_idempotency().lookup(token, body_hash, cached);
+        if (r == 1) return ok(std::move(cached));
+        if (r == 2) {
+            return error(400, "IdempotentParameterMismatchException",
+                         "Request parameters do not match the parameters of a previous request "
+                         "with the same ClientRequestToken");
+        }
     }
     // Two-phase: validate keys/conditions, then apply. Conditions are checked
     // against a current snapshot so the all-or-nothing contract holds for the
@@ -1634,6 +1780,17 @@ ApiResult handle_transact_write_items(engine::TableManager& tables, engine::Stor
         actions.push_back(std::move(a));
     }
 
+    // A transaction may not act on the same item twice (AWS rejects this).
+    {
+        std::set<std::string> seen_targets;
+        for (const auto& a : actions) {
+            if (!seen_targets.insert(a.table + std::string(1, '\0') + a.key).second) {
+                return error(400, "ValidationException",
+                             "Transaction request cannot include multiple operations on one item");
+            }
+        }
+    }
+
     // Phase 1: verify every condition AND fully evaluate every UpdateExpression
     // against the current snapshot. Nothing is written in this phase, so any
     // validation failure (bad condition, malformed/unsatisfiable update) aborts the
@@ -1689,6 +1846,7 @@ ApiResult handle_transact_write_items(engine::TableManager& tables, engine::Stor
                                         extract_keys(*def, precomputed_updates[i]), old, precomputed_updates[i]);
         }
     }
+    if (has_token) txn_idempotency().store(token, body_hash, "{}");
     return ok("{}");
 }
 
@@ -2452,7 +2610,7 @@ ApiResult handle_operation(engine::TableManager& tables, engine::StorageEngine& 
             case Operation::Query:              return handle_query(tables, storage, doc);
             case Operation::BatchWriteItem:     return handle_batch_write_item(tables, storage, doc, streams);
             case Operation::BatchGetItem:       return handle_batch_get_item(tables, storage, doc);
-            case Operation::TransactWriteItems: return handle_transact_write_items(tables, storage, doc, streams);
+            case Operation::TransactWriteItems: return handle_transact_write_items(tables, storage, doc, streams, body);
             case Operation::TransactGetItems:   return handle_transact_get_items(tables, storage, doc);
             case Operation::ExecuteStatement:   return handle_execute_statement(tables, storage, streams, doc);
             case Operation::BatchExecuteStatement: return handle_batch_execute_statement(tables, storage, streams, doc);

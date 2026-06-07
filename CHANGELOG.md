@@ -4,6 +4,31 @@ All notable changes to cynamoDB are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/) and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [2.5.0] - 2026-06-07
+
+DynamoDB-compatibility parity from the improvement plan's round-6 deep sweep
+(sophisticated access patterns). The external QA battery (18 suites / 165 checks)
+now reports **0 failures**.
+
+### Added / Fixed
+- **CS-21 — transaction idempotency.** `TransactWriteItems` honors `ClientRequestToken`:
+  a retry with the same token returns the cached result without re-applying (bounded,
+  10-minute TTL cache); reusing a token with a different request body returns
+  `IdempotentParameterMismatchException`. This makes SDK auto-retries safe.
+- **CS-20 — duplicate transaction targets.** A `TransactWriteItems` with two operations
+  on the same `{TableName, Key}` is rejected with `ValidationException`.
+- **CS-18 — `Select=COUNT`.** `Query`/`Scan` with `Select=COUNT` return `Count`/
+  `ScannedCount` only (no `Items`); `Select=COUNT` with a `ProjectionExpression` is
+  rejected.
+- **CS-22 — `ReturnValues=UPDATED_NEW`/`UPDATED_OLD`.** `UpdateItem` now returns only the
+  attributes the update actually changed, not the whole item.
+- **CS-19 — `ConsistentRead` on a GSI.** Rejected with `ValidationException` (GSIs are
+  eventually consistent); LSIs and base-table consistent reads are unaffected.
+
+### Tests
+- New `test_qa_round6.cpp`. 153 unit cases + 5 integration groups, green under
+  ASan + UBSan; external QA battery 162 pass / 0 fail / 3 info.
+
 ## [2.4.3] - 2026-06-07
 
 HTTP-layer correctness, addressing the QA battery's three observational (`info`) probes.
