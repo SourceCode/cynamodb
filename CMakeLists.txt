@@ -22,6 +22,18 @@ else()
     if(CYNAMODB_HAS_NO_ERROR_DEPRECATED_LITERAL_OPERATOR)
         list(APPEND CYNAMODB_WARNING_FLAGS -Wno-error=deprecated-literal-operator)
     endif()
+    # GCC 11-13 emit false-positive -Wstringop-overread / -Wrestrict diagnostics on
+    # std::char_traits / simdjson usage under -O2+LTO (bogus "bound exceeds maximum object
+    # size" / "accessing N bytes may overlap" messages with absurd sizes). They are known
+    # compiler bugs, not defects in our code, so downgrade them to warnings where the
+    # compiler supports it while keeping -Werror on for everything else.
+    foreach(_cynamodb_fp stringop-overread restrict)
+        string(MAKE_C_IDENTIFIER "CYNAMODB_HAS_NO_ERROR_${_cynamodb_fp}" _cynamodb_fp_var)
+        check_cxx_compiler_flag(-Wno-error=${_cynamodb_fp} ${_cynamodb_fp_var})
+        if(${_cynamodb_fp_var})
+            list(APPEND CYNAMODB_WARNING_FLAGS -Wno-error=${_cynamodb_fp})
+        endif()
+    endforeach()
 endif()
 
 if(POLICY CMP0167)
