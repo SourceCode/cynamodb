@@ -6,6 +6,7 @@
 #include <string>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <memory>
 #include <expected>
 #include <cynamodb/core/schema.hpp>
@@ -54,7 +55,9 @@ private:
     };
 
     std::map<std::string, std::shared_ptr<TableBuckets>, core::StringViewLess> tables_;
-    std::mutex mutex_;
+    // Shared: consume_rcu/wcu only look up + copy a shared_ptr on the per-request hot
+    // path (parallel-safe); register/unregister take it exclusively.
+    mutable std::shared_mutex mutex_;
 };
 
 } // namespace cynamodb::engine::capacity

@@ -54,7 +54,7 @@ void TokenBucket::update_rate(double new_rate_per_sec) {
 }
 
 void CapacityManager::register_table(const core::TableDefinition& table_def) {
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     auto buckets = std::make_shared<TableBuckets>();
     buckets->billing_mode = table_def.billing_mode;
     
@@ -73,14 +73,14 @@ void CapacityManager::register_table(const core::TableDefinition& table_def) {
 }
 
 void CapacityManager::unregister_table(const std::string& table_name) {
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     tables_.erase(table_name);
 }
 
 std::expected<void, CapacityError> CapacityManager::consume_rcu(const std::string& table_name, double units) {
     std::shared_ptr<TableBuckets> buckets;
     {
-        std::lock_guard lock(mutex_);
+        std::shared_lock lock(mutex_);
         auto it = tables_.find(table_name);
         if (it == tables_.end()) return std::unexpected(CapacityError::TableNotFound);
         buckets = it->second;
@@ -95,7 +95,7 @@ std::expected<void, CapacityError> CapacityManager::consume_rcu(const std::strin
 std::expected<void, CapacityError> CapacityManager::consume_wcu(const std::string& table_name, double units) {
     std::shared_ptr<TableBuckets> buckets;
     {
-        std::lock_guard lock(mutex_);
+        std::shared_lock lock(mutex_);
         auto it = tables_.find(table_name);
         if (it == tables_.end()) return std::unexpected(CapacityError::TableNotFound);
         buckets = it->second;

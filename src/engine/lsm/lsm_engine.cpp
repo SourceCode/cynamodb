@@ -8,6 +8,7 @@
 #include <iostream>
 #include <map>
 #include <set>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -289,22 +290,31 @@ void LsmEngine::drop_table(const std::string& table_name) {
     std::unique_lock lock(mutex_);
     // The LSM keeps all tables in one keyspace, so dropping a table means
     // tombstoning every key under its prefix. Compaction later reclaims the space.
-    auto live = materialize();
     const std::string prefix = table_prefix(table_name);
+    auto live = materialize(prefix);
     for (auto it = live.lower_bound(prefix); it != live.end(); ++it) {
         if (it->first.compare(0, prefix.size(), prefix) != 0) break;
         remove_locked(it->first);
     }
 }
 
-// Builds a merged, tombstone-resolved, sorted view of the whole table by reading
-// every level newest-first and keeping the first decision seen for each key.
-std::map<std::string, StorageEngine::AttributeMap, core::StringViewLess> LsmEngine::materialize() const {
+// Builds a merged, tombstone-resolved, sorted view by reading every level newest-first
+// and keeping the first decision seen for each key. When `prefix` is set the work is
+// bounded to that key range: memtable entries outside it are skipped, and — critically
+// — only in-range SSTable keys are DECODED (sstable->get is the expensive step). This
+// keeps a Scan/Query proportional to the queried table, not the whole store.
+std::map<std::string, StorageEngine::AttributeMap, core::StringViewLess> LsmEngine::materialize(std::string_view prefix) const {
     std::map<std::string, AttributeMap, core::StringViewLess> live;
     std::set<std::string> decided;
 
+    auto in_prefix = [&](const std::string& k) {
+        return prefix.empty() ||
+               (k.size() >= prefix.size() && k.compare(0, prefix.size(), prefix.data(), prefix.size()) == 0);
+    };
+
     auto consider = [&](const std::map<std::string, Skiplist::SnapshotEntry, core::StringViewLess>& snapshot) {
         for (const auto& [k, e] : snapshot) {
+            if (!in_prefix(k)) continue;              // outside the requested table
             if (!decided.insert(k).second) continue;  // newer level already decided
             if (!e.is_deleted) live.emplace(k, e.attributes);
         }
@@ -315,10 +325,18 @@ std::map<std::string, StorageEngine::AttributeMap, core::StringViewLess> LsmEngi
         consider(it->table->get_all_entries());
     }
     for (const auto& sstable : sstables_) {  // newest-first
-        for (const auto& idx : sstable->index()) {
-            if (!decided.insert(idx.key).second) continue;
-            if (auto v = sstable->get(idx.key)) {
-                live.emplace(idx.key, *v);
+        const auto& idx = sstable->index();
+        // index() is key-sorted; jump to the prefix range so out-of-table keys are
+        // never decoded (they used to be — that was the O(store)-per-query blowup).
+        auto begin = prefix.empty()
+            ? idx.begin()
+            : std::lower_bound(idx.begin(), idx.end(), prefix,
+                  [](const SSTable::IndexEntry& e, std::string_view p) { return std::string_view(e.key) < p; });
+        for (auto e = begin; e != idx.end(); ++e) {
+            if (!in_prefix(e->key)) break;             // sorted: past the prefix range
+            if (!decided.insert(e->key).second) continue;
+            if (auto v = sstable->get(e->key)) {
+                live.emplace(e->key, *v);
             }
             // else: tombstone; shadow older levels by leaving it out.
         }
@@ -329,9 +347,9 @@ std::map<std::string, StorageEngine::AttributeMap, core::StringViewLess> LsmEngi
 LsmEngine::ScanResult LsmEngine::scan(const std::string& table_name, const std::optional<std::string>& exclusive_start_key, size_t limit) {
     ScanResult result;
     std::shared_lock lock(mutex_);
-    auto live = materialize();
-
     const std::string prefix = table_prefix(table_name);
+    auto live = materialize(prefix);
+
     auto it = exclusive_start_key ? live.upper_bound(prefix + *exclusive_start_key)
                                    : live.lower_bound(prefix);
     for (; it != live.end(); ++it) {
@@ -349,9 +367,9 @@ LsmEngine::ScanResult LsmEngine::scan(const std::string& table_name, const std::
 LsmEngine::QueryResult LsmEngine::query(const std::string& table_name, const AttributeMap& key_conditions, const std::optional<std::string>& exclusive_start_key, size_t limit) {
     QueryResult result;
     std::shared_lock lock(mutex_);
-    auto live = materialize();
-
     const std::string prefix = table_prefix(table_name);
+    auto live = materialize(prefix);
+
     auto it = exclusive_start_key ? live.upper_bound(prefix + *exclusive_start_key)
                                    : live.lower_bound(prefix);
     std::string last_user_key;

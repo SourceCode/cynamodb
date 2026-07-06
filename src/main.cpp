@@ -53,10 +53,15 @@ int main() {
             }
         }
 
-        // Build the execution context (table catalog + storage engine + streams)
-        // and start the HTTP server that speaks the DynamoDB JSON protocol.
+        // hardware_concurrency() can report 0 when it can't detect the CPU count; never
+        // run a zero-thread server (it would accept nothing).
+        if (threads < 1) threads = 1;
+
+        // Build the execution context (table catalog + storage engine + streams) and
+        // start the HTTP server. The server sizes its io_context to `threads` so the
+        // multi-threaded scheduler is used and requests run in parallel across cores.
         cynamodb::Context ctx;
-        cynamodb::http::HttpServer server(ctx);
+        cynamodb::http::HttpServer server(ctx, threads);
 
         std::cout << "Listening on " << bind_addr << ":" << port << " with " << threads << " threads" << std::endl;
         server.run(bind_addr, static_cast<unsigned short>(port), threads);

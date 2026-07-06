@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(cynamoDB VERSION 2.5.0 LANGUAGES CXX)
+project(cynamoDB VERSION 2.5.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

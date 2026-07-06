@@ -4,6 +4,47 @@ All notable changes to cynamoDB are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/) and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [2.5.1] - 2026-07-06
+
+Concurrency and scalability fixes. Under concurrent multi-threaded load with a
+non-trivial dataset (~tens of thousands of items), the server previously pinned a
+single core at 100% and became unresponsive (health checks timing out); clients then
+retried, causing a congestion collapse. Root causes were an under-parallelized event
+loop and a per-query full-store scan. No API/protocol changes.
+
+### Fixed
+- **Event loop ran single-threaded.** The Boost.Asio `io_context` was constructed with
+  a concurrency hint of `1` (which selects the lock-free, single-thread-only scheduler)
+  while `run()` spawned one thread per core. The N worker threads therefore serialized
+  onto one core. The `io_context` is now sized to the actual worker-thread count, so
+  requests run in parallel across cores. (`src/http/server.cpp`, `src/main.cpp`)
+- **Every Query/Scan decoded the entire keyspace.** `materialize()` built a merged,
+  decoded view of **all tables and all records** on every `Query`/`Scan`, then applied
+  the limit afterward — O(total store) per call regardless of which (possibly tiny)
+  table was queried. It is now bounded to the requested table's key prefix (binary
+  search into each SSTable's sorted index; only in-range records are decoded), making a
+  query proportional to its own table instead of the whole store. This removes the
+  cross-table amplification that turned small, frequent queries into full-store scans.
+  (`src/engine/lsm/lsm_engine.cpp`)
+- **Per-request capacity lookup took an exclusive lock.** `consume_rcu`/`consume_wcu`
+  held a `std::mutex` for a read-only table lookup on every data-plane request; this is
+  now a `std::shared_mutex` (shared for lookups, exclusive only for table
+  register/unregister). (`src/engine/capacity/manager.cpp`)
+- Guard against a zero-thread server when `hardware_concurrency()` reports 0.
+  (`src/main.cpp`)
+
+### Known follow-ups (documented, not yet changed)
+- Compaction runs the full merge + SSTable write while holding the engine's exclusive
+  lock, briefly stalling all readers/writers; the flush path already does this work
+  outside the lock and compaction should mirror it.
+- The WAL `fdatasync` runs under the engine's exclusive write lock, serializing writes
+  at fsync latency and stalling parallel reads; group-commit outside the lock would lift
+  write throughput. (`CYNAMODB_WAL_FSYNC=0` disables the fsync as an interim.)
+
+### Tests
+- All unit + integration suites green (unit, crud, crash-recovery, concurrent-load,
+  features).
+
 ## [2.5.0] - 2026-06-07
 
 DynamoDB-compatibility parity from the improvement plan's round-6 deep sweep

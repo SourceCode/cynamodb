@@ -10,8 +10,11 @@
 
 namespace cynamodb::http {
 
-HttpServer::HttpServer(Context& ctx)
-    : ctx_(ctx), ioc_(1), acceptor_(net::make_strand(ioc_)) {}
+HttpServer::HttpServer(Context& ctx, int io_threads)
+    // Size the io_context to the actual worker-thread count. io_context(1) selects the
+    // single-threaded scheduler (lock-free, one-thread-only); with N>1 threads that
+    // serializes every request onto one core and collapses under concurrent load.
+    : ctx_(ctx), ioc_(io_threads > 1 ? io_threads : 1), acceptor_(net::make_strand(ioc_)) {}
 
 HttpServer::~HttpServer() {
     stop();
@@ -94,7 +97,7 @@ void HttpSession::on_read(beast::error_code ec, std::size_t bytes_transferred) {
 
 void HttpSession::handle_request() {
     http::response<http::string_body> res{http::status::ok, req_.version()};
-    res.set(http::field::server, "cynamoDB/2.5.0");
+    res.set(http::field::server, "cynamoDB/2.5.1");
 
     // Echo the DynamoDB JSON protocol version the client used (1.0 or 1.1); default
     // to 1.0. Input is otherwise content-type-lenient, matching AWS.

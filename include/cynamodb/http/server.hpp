@@ -20,7 +20,12 @@ using tcp = net::ip::tcp;
 
 class HttpServer {
 public:
-    explicit HttpServer(Context& ctx);
+    // io_threads must equal the number of threads that will call run(): it sizes the
+    // io_context's concurrency hint. A hint of 1 enables Asio's single-threaded
+    // scheduler optimizations (no internal locking); running multiple threads on such
+    // a context serializes all work onto one core. Pass the real thread count so the
+    // multi-threaded, lock-protected scheduler is used when io_threads > 1.
+    HttpServer(Context& ctx, int io_threads);
     ~HttpServer();
 
     void run(const std::string& address, unsigned short port, int threads);

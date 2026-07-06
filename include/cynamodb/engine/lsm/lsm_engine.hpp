@@ -45,9 +45,12 @@ private:
     // mutex_ held exclusively.
     void compact_locked();
     std::string get_table_path(const std::string& table_name) const;
-    // Merged, tombstone-resolved, sorted snapshot of the table across all levels.
-    // Caller must hold mutex_ (shared is sufficient).
-    std::map<std::string, AttributeMap, core::StringViewLess> materialize() const;
+    // Merged, tombstone-resolved, sorted snapshot across all levels. Caller must hold
+    // mutex_ (shared is sufficient). When `prefix` is non-empty the result is bounded
+    // to that key range (one table), so a Scan/Query decodes only that table's records
+    // instead of the entire store — the difference between O(table) and O(store) per
+    // query, which is what let concurrent queries pin every core once the store grew.
+    std::map<std::string, AttributeMap, core::StringViewLess> materialize(std::string_view prefix = {}) const;
 
     // --- durability / recovery ---
     std::string wal_path(uint64_t generation) const;
