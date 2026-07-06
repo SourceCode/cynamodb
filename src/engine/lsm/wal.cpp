@@ -78,15 +78,16 @@ bool WriteAheadLog::verify_header() {
     return true;
 }
 
-bool WriteAheadLog::append(uint64_t seq, const std::string& key, const std::string& value) {
-    std::lock_guard lock(mutex_);
+// Writes one record to the file buffer. Caller holds mutex_. Durability is a separate
+// step (commit()), so this does no flush/fsync.
+bool WriteAheadLog::write_record(uint64_t seq, const std::string& key, const std::string& value) {
     if (!file_.is_open()) return false;
 
     WALRecord record;
     record.sequence_number = seq;
     record.key_size = static_cast<uint32_t>(key.size());
     record.val_size = static_cast<uint32_t>(value.size());
-    
+
     uint32_t crc = utils::crc32c(std::string_view(reinterpret_cast<const char*>(&record), sizeof(uint64_t) + 2 * sizeof(uint32_t)));
     crc = utils::crc32c_extend(crc, reinterpret_cast<const uint8_t*>(key.data()), key.size());
     crc = utils::crc32c_extend(crc, reinterpret_cast<const uint8_t*>(value.data()), value.size());
@@ -97,24 +98,55 @@ bool WriteAheadLog::append(uint64_t seq, const std::string& key, const std::stri
     file_.write(key.data(), key.size());
     file_.write(value.data(), value.size());
 
-    if (!file_.good()) return false;
+    return file_.good();
+}
 
-    // Durably commit every record. sync() flushes file_ to the OS and, when
-    // fsync is enabled, fdatasyncs to the device so an acknowledged write
-    // survives both a process crash (kill -9) and a power/OS crash.
-    return sync();
+bool WriteAheadLog::append_only(uint64_t seq, const std::string& key, const std::string& value) {
+    std::lock_guard lock(mutex_);
+    if (!write_record(seq, key, value)) return false;
+    appended_.fetch_add(1, std::memory_order_release);
+    return true;
+}
+
+bool WriteAheadLog::append(uint64_t seq, const std::string& key, const std::string& value) {
+    if (!append_only(seq, key, value)) return false;
+    // Durable before returning (recovery/rebuild path relies on this).
+    return commit();
+}
+
+// Ensure everything appended before this call is on stable storage. Concurrent callers
+// coalesce: the first flushes + fdatasyncs the whole file (covering every pending
+// record), and callers whose records are already covered return without a second fsync.
+bool WriteAheadLog::commit() {
+    if (!file_.is_open()) return false;
+    // Our own record was appended (appended_ bumped) before this call, so this snapshot
+    // includes it; if someone already synced past it we are done.
+    const uint64_t needed = appended_.load(std::memory_order_acquire);
+    std::lock_guard sync_lock(sync_mutex_);
+    if (synced_ >= needed) return true;
+
+    uint64_t target;
+    bool ok;
+    {
+        std::lock_guard lock(mutex_);
+        file_.flush();                                       // ostream buffer -> OS
+        target = appended_.load(std::memory_order_relaxed);  // everything written so far
+        ok = file_.good();
+    }
+#ifndef _WIN32
+    if (fsync_each_ && sync_fd_ >= 0) {
+        ::fdatasync(sync_fd_);                               // OS -> device (outside mutex_)
+    }
+#endif
+    unsynced_writes_ = 0;
+    if (target > synced_) synced_ = target;
+    return ok;
 }
 
 bool WriteAheadLog::sync() {
-    if (!file_.is_open()) return false;
-    file_.flush();
-    unsynced_writes_ = 0;
-#ifndef _WIN32
-    if (fsync_each_ && sync_fd_ >= 0) {
-        ::fdatasync(sync_fd_);
-    }
-#endif
-    return file_.good();
+    // Full durability barrier (used at WAL rotation / shutdown); commit() already makes
+    // every pending record durable.
+    return commit();
 }
 
 bool WriteAheadLog::reset() {

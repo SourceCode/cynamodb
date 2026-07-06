@@ -4,6 +4,37 @@ All notable changes to cynamoDB are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/) and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [2.5.2] - 2026-07-06
+
+Follow-through on the two concurrency hot spots documented in 2.5.1: the engine's
+exclusive lock is no longer held across slow blocking work (compaction file writes and
+WAL fsyncs), so background maintenance and durable writes no longer freeze concurrent
+readers/writers. No API/protocol changes; crash-durability is unchanged (verified).
+
+### Fixed
+- **Compaction held the engine lock across the whole merge + SSTable write.**
+  `background_compaction` took the exclusive `mutex_` and ran the entire compaction
+  under it — reading/decoding every SSTable and writing the merged file (disk I/O) —
+  so every reader and writer was blocked for the full duration (a periodic freeze that
+  worsened with data size). Compaction now works in phases like `flush_memtable`: it
+  snapshots the SSTable set under the lock, performs the merge + file write **unlocked**,
+  then re-acquires the lock only to swap the manifest — preserving any SSTables flushed
+  concurrently. (`src/engine/lsm/lsm_engine.cpp`)
+- **Every write fsynced while holding the engine's exclusive lock.** `WriteAheadLog::append`
+  called `fdatasync` on each record, and `put`/`remove`/`mutate` held `mutex_` across it,
+  serializing all writes at fsync latency and stalling parallel reads for each write.
+  The WAL now separates the append (buffered write, under the WAL's own lock) from
+  durability (`commit()`), and the engine commits **after releasing** `mutex_`. `commit()`
+  is a **group commit**: concurrent writers coalesce into a single `fdatasync` that
+  durably commits all their pending records. A write is still not acknowledged until its
+  record is durable, so acknowledged-write durability across a hard crash is unchanged.
+  (`src/engine/lsm/wal.cpp`, `src/engine/lsm/lsm_engine.cpp`)
+
+### Tests
+- All unit + integration suites green, including `crash_recovery_integration`, which
+  SIGKILLs the server (no graceful shutdown, fsync on) and asserts every acknowledged
+  write and deletion survives — twice.
+
 ## [2.5.1] - 2026-07-06
 
 Concurrency and scalability fixes. Under concurrent multi-threaded load with a

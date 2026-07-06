@@ -3,6 +3,7 @@
 #include <string>
 #include <fstream>
 #include <mutex>
+#include <atomic>
 #include <cstdint>
 #include <optional>
 #include <vector>
@@ -39,7 +40,17 @@ public:
     WriteAheadLog(const std::string& path, bool fsync_each);
     ~WriteAheadLog();
 
+    // Durable append: writes the record and fsyncs before returning (equivalent to
+    // append_only + commit). Used by the recovery/rebuild path.
     bool append(uint64_t seq, const std::string& key, const std::string& value);
+    // Non-durable append: writes the record but does NOT fsync. The caller makes it
+    // durable with commit() — typically AFTER releasing the engine lock, so the fsync
+    // no longer serializes readers/writers. Returns false only on a write failure.
+    bool append_only(uint64_t seq, const std::string& key, const std::string& value);
+    // Group commit: ensures every record appended before this call is on stable
+    // storage, coalescing concurrent callers into a single fdatasync (one fsync can
+    // durably commit many pending records). Safe to call without any engine lock held.
+    bool commit();
     bool sync();
     bool reset();
 
@@ -53,10 +64,18 @@ public:
 private:
     bool write_header();
     bool verify_header();
+    // Appends one record to the file. Caller must hold mutex_.
+    bool write_record(uint64_t seq, const std::string& key, const std::string& value);
 
     std::string path_;
     std::fstream file_;
     std::mutex mutex_;
+    // Group-commit bookkeeping: appended_ counts records written (bumped under mutex_);
+    // synced_ is the count known durable (guarded by sync_mutex_). commit() serializes
+    // fsyncs on sync_mutex_ so concurrent writers share one fdatasync.
+    std::mutex sync_mutex_;
+    std::atomic<uint64_t> appended_{0};
+    uint64_t synced_ = 0;
     uint32_t unsynced_writes_ = 0;
     uint64_t file_size_bytes_ = 0;
     bool fsync_each_ = true;

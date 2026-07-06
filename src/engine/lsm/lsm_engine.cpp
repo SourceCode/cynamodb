@@ -157,7 +157,7 @@ void LsmEngine::recover_from_wal() {
     // recovered memtable into it so the old segments can be safely discarded. After
     // this, exactly one WAL segment exists and fully describes the live memtable.
     wal_generation_ = any ? max_gen + 1 : 0;
-    wal_ = std::make_unique<WriteAheadLog>(wal_path(wal_generation_));
+    wal_ = std::make_shared<WriteAheadLog>(wal_path(wal_generation_));
     for (const auto& [k, entry] : memtable_->get_all_entries()) {
         std::string value;
         if (entry.is_deleted) {
@@ -184,7 +184,9 @@ void LsmEngine::append_to_wal(const std::string& internal_key, bool is_delete, c
         value.push_back('P');
         value += encode_attributes(attributes);
     }
-    wal_->append(wal_seq_++, internal_key, value);
+    // Write the record but do NOT fsync here — the caller commits the WAL after
+    // releasing the engine lock so the fsync doesn't stall concurrent reads/writes.
+    wal_->append_only(wal_seq_++, internal_key, value);
 }
 
 LsmEngine::~LsmEngine() {
@@ -205,25 +207,30 @@ LsmEngine::~LsmEngine() {
     manifest_->save();
 }
 
-void LsmEngine::put_locked(const std::string& ik, const AttributeMap& attributes) {
+std::shared_ptr<WriteAheadLog> LsmEngine::put_locked(const std::string& ik, const AttributeMap& attributes) {
+    auto target_wal = wal_;  // the WAL this record is appended to
     append_to_wal(ik, false, attributes);
     memtable_->put(ik, attributes);
     if (memtable_->size() >= memtable_flush_threshold_) {
         // Freeze the memtable together with its WAL segment, then start a fresh
-        // memtable and WAL generation. The frozen segment stays on disk until the
-        // memtable is flushed to an SSTable (see flush_memtable).
+        // memtable and WAL generation. sync() here makes the frozen segment (including
+        // the record just appended) durable before it is abandoned for a new WAL, so
+        // the caller's later commit(target_wal) is a cheap, already-synced no-op.
         wal_->sync();
         immutable_memtables_.push_back({std::move(memtable_), wal_path(wal_generation_)});
         memtable_ = std::make_unique<MemTable>();
         ++wal_generation_;
-        wal_ = std::make_unique<WriteAheadLog>(wal_path(wal_generation_));
+        wal_ = std::make_shared<WriteAheadLog>(wal_path(wal_generation_));
         flush_cv_.notify_one();
     }
+    return target_wal;
 }
 
-void LsmEngine::remove_locked(const std::string& ik) {
+std::shared_ptr<WriteAheadLog> LsmEngine::remove_locked(const std::string& ik) {
+    auto target_wal = wal_;
     append_to_wal(ik, true, {});
     memtable_->remove(ik);
+    return target_wal;
 }
 
 std::optional<StorageEngine::AttributeMap> LsmEngine::get_locked(const std::string& ik) const {
@@ -249,13 +256,23 @@ std::optional<StorageEngine::AttributeMap> LsmEngine::get_locked(const std::stri
 }
 
 void LsmEngine::put(const std::string& table_name, const std::string& key, const AttributeMap& attributes) {
-    std::unique_lock lock(mutex_);
-    put_locked(internal_key(table_name, key), attributes);
+    std::shared_ptr<WriteAheadLog> committed_wal;
+    {
+        std::unique_lock lock(mutex_);
+        committed_wal = put_locked(internal_key(table_name, key), attributes);
+    }
+    // fsync outside the engine lock (group-committed). The client is not acknowledged
+    // until this returns, so an acknowledged write is still durable.
+    if (committed_wal) committed_wal->commit();
 }
 
 void LsmEngine::remove(const std::string& table_name, const std::string& key) {
-    std::unique_lock lock(mutex_);
-    remove_locked(internal_key(table_name, key));
+    std::shared_ptr<WriteAheadLog> committed_wal;
+    {
+        std::unique_lock lock(mutex_);
+        committed_wal = remove_locked(internal_key(table_name, key));
+    }
+    if (committed_wal) committed_wal->commit();
 }
 
 std::optional<StorageEngine::AttributeMap> LsmEngine::get(const std::string& table_name, const std::string& key) {
@@ -264,38 +281,46 @@ std::optional<StorageEngine::AttributeMap> LsmEngine::get(const std::string& tab
 }
 
 LsmEngine::MutationOutcome LsmEngine::mutate(const std::string& table_name, const std::string& key, const Mutator& mutator) {
-    std::unique_lock lock(mutex_);
-    const std::string ik = internal_key(table_name, key);
     MutationOutcome outcome;
-    auto current = get_locked(ik);
-    if (current) outcome.previous = current;
+    std::shared_ptr<WriteAheadLog> committed_wal;
+    {
+        std::unique_lock lock(mutex_);
+        const std::string ik = internal_key(table_name, key);
+        auto current = get_locked(ik);
+        if (current) outcome.previous = current;
 
-    Mutation m = mutator(current ? &*current : nullptr);
-    switch (m.kind) {
-        case MutationKind::Put:
-            put_locked(ik, m.attributes);
-            outcome.applied = true;
-            break;
-        case MutationKind::Delete:
-            remove_locked(ik);
-            outcome.applied = true;
-            break;
-        case MutationKind::None:
-            break;
+        Mutation m = mutator(current ? &*current : nullptr);
+        switch (m.kind) {
+            case MutationKind::Put:
+                committed_wal = put_locked(ik, m.attributes);
+                outcome.applied = true;
+                break;
+            case MutationKind::Delete:
+                committed_wal = remove_locked(ik);
+                outcome.applied = true;
+                break;
+            case MutationKind::None:
+                break;
+        }
     }
+    if (committed_wal) committed_wal->commit();  // durable before returning to the caller
     return outcome;
 }
 
 void LsmEngine::drop_table(const std::string& table_name) {
-    std::unique_lock lock(mutex_);
-    // The LSM keeps all tables in one keyspace, so dropping a table means
-    // tombstoning every key under its prefix. Compaction later reclaims the space.
-    const std::string prefix = table_prefix(table_name);
-    auto live = materialize(prefix);
-    for (auto it = live.lower_bound(prefix); it != live.end(); ++it) {
-        if (it->first.compare(0, prefix.size(), prefix) != 0) break;
-        remove_locked(it->first);
+    std::shared_ptr<WriteAheadLog> committed_wal;
+    {
+        std::unique_lock lock(mutex_);
+        // The LSM keeps all tables in one keyspace, so dropping a table means
+        // tombstoning every key under its prefix. Compaction later reclaims the space.
+        const std::string prefix = table_prefix(table_name);
+        auto live = materialize(prefix);
+        for (auto it = live.lower_bound(prefix); it != live.end(); ++it) {
+            if (it->first.compare(0, prefix.size(), prefix) != 0) break;
+            committed_wal = remove_locked(it->first);  // all removes share one WAL
+        }
     }
+    if (committed_wal) committed_wal->commit();  // one group-commit for the whole drop
 }
 
 // Builds a merged, tombstone-resolved, sorted view by reading every level newest-first
@@ -444,36 +469,46 @@ void LsmEngine::flush_memtable() {
 
 void LsmEngine::background_compaction() {
     while (!shutting_down_) {
-        std::unique_lock lock(mutex_);
-        // Edge-triggered: only run when the flush thread flags work, so a no-op
-        // pass can't spin the predicate true forever.
-        compaction_cv_.wait(lock, [this] { return shutting_down_ || compaction_pending_; });
-        if (shutting_down_) break;
-        compaction_pending_ = false;
-        compact_locked();  // runs with the lock held (serialized with flush/reads)
+        {
+            std::unique_lock lock(mutex_);
+            // Edge-triggered: only run when the flush thread flags work, so a no-op
+            // pass can't spin the predicate true forever.
+            compaction_cv_.wait(lock, [this] { return shutting_down_ || compaction_pending_; });
+            if (shutting_down_) break;
+            compaction_pending_ = false;
+        }
+        // Compact WITHOUT holding the lock: compact() re-acquires it only to snapshot
+        // and to publish. The heavy merge + SSTable write runs unlocked so readers and
+        // writers are not frozen for the duration (the old path held mutex_ across the
+        // whole merge + disk write, stalling everything at scale).
+        compact();
     }
 }
 
-void LsmEngine::compact_locked() {
-    if (sstables_.size() < 2) return;  // nothing to gain from merging one file
-
-    // Look up the (level, seq) of every SSTable from the manifest.
+void LsmEngine::compact() {
+    // --- Phase 1: snapshot the SSTable set + manifest refs under the lock. ---
+    std::deque<std::shared_ptr<SSTable>> to_merge;
     std::map<std::string, std::pair<uint32_t, uint64_t>> manifest_files;
-    for (uint32_t level = 0; level < 16; ++level) {
-        for (const auto& m : manifest_->get_level_files(level)) {
-            manifest_files[m.path] = {level, m.sequence_number};
+    {
+        std::unique_lock lock(mutex_);
+        if (sstables_.size() < 2) return;  // nothing to gain from merging one file
+        to_merge = sstables_;              // copy of shared_ptrs (newest-first)
+        for (uint32_t level = 0; level < 16; ++level) {
+            for (const auto& m : manifest_->get_level_files(level)) {
+                manifest_files[m.path] = {level, m.sequence_number};
+            }
         }
     }
 
-    // Merge all SSTables newest-first: the first version seen of a key wins, and
-    // a tombstone (key present in the index but get() returns nothing) drops the
-    // key entirely. This is safe because we merge the complete on-disk set, so no
-    // older version of a dropped key can survive below the result.
+    // --- Phase 2: merge + write the result, UNLOCKED (the expensive part). ---
+    // Merge newest-first: the first version seen of a key wins, and a tombstone (key
+    // in the index but get() returns nothing) drops the key entirely. Safe because we
+    // merge the complete snapshot, so no older version of a dropped key survives below.
     std::map<std::string, Skiplist::SnapshotEntry, core::StringViewLess> merged;
     std::set<std::string> seen;
     uint64_t merged_seq = 0;
     std::vector<std::string> old_paths;
-    for (const auto& sstable : sstables_) {  // newest-first
+    for (const auto& sstable : to_merge) {  // newest-first
         old_paths.push_back(sstable->path());
         auto mit = manifest_files.find(sstable->path());
         if (mit != manifest_files.end()) merged_seq = std::max(merged_seq, mit->second.second);
@@ -485,30 +520,44 @@ void LsmEngine::compact_locked() {
         }
     }
 
-    // The merged file inherits the highest sequence number it replaces, so any
-    // SSTable flushed after this compaction still sorts as newer on restart.
+    // The merged file inherits the highest sequence number it replaces, so any SSTable
+    // flushed after this compaction still sorts as newer on restart.
     const std::string merged_path =
         db_path_ + "/table_" + std::to_string(merged_seq) + "_c.sst";
-    SSTable::create(merged_path, merged);
+    SSTable::create(merged_path, merged);  // slow file I/O, done without the lock
 
-    // Swap manifest entries: drop every merged file, add the single result at L1.
-    for (const auto& [path, ref] : manifest_files) {
-        manifest_->remove_file(ref.first, path);
-    }
-    SSTableMetadata meta;
-    meta.path = merged_path;
-    meta.level = 1;
-    meta.sequence_number = merged_seq;
-    if (!merged.empty()) {
-        meta.min_key = merged.begin()->first;
-        meta.max_key = merged.rbegin()->first;
-    }
-    manifest_->add_file(1, meta);
-    manifest_->save();
+    // --- Phase 3: publish under the lock, preserving concurrently-flushed SSTables. ---
+    {
+        std::unique_lock lock(mutex_);
+        // Drop only the files we actually merged; flush only ever ADDS files, so any
+        // entry not in our snapshot was flushed during the merge and must survive.
+        for (const auto& [path, ref] : manifest_files) {
+            manifest_->remove_file(ref.first, path);
+        }
+        SSTableMetadata meta;
+        meta.path = merged_path;
+        meta.level = 1;
+        meta.sequence_number = merged_seq;
+        if (!merged.empty()) {
+            meta.min_key = merged.begin()->first;
+            meta.max_key = merged.rbegin()->first;
+        }
+        manifest_->add_file(1, meta);
+        manifest_->save();
 
-    // Swap the in-memory list and delete the now-obsolete files from disk.
-    sstables_.clear();
-    sstables_.push_back(std::make_shared<SSTable>(merged_path));
+        // Rebuild the in-memory list: keep SSTables flushed during the unlocked merge
+        // (newer than merged_seq, so they stay at the front, newest-first), then append
+        // the merged result as the oldest level.
+        const std::set<std::string> merged_set(old_paths.begin(), old_paths.end());
+        std::deque<std::shared_ptr<SSTable>> kept;
+        for (const auto& s : sstables_) {
+            if (!merged_set.count(s->path())) kept.push_back(s);
+        }
+        kept.push_back(std::make_shared<SSTable>(merged_path));
+        sstables_ = std::move(kept);
+    }
+
+    // Delete the now-obsolete files from disk (outside the lock).
     for (const auto& p : old_paths) {
         std::error_code ec;
         std::filesystem::remove(p, ec);

@@ -35,15 +35,20 @@ private:
     // Used by the public put/remove and by mutate() so a read-modify-write can
     // happen atomically under a single lock acquisition.
     std::optional<AttributeMap> get_locked(const std::string& internal_key) const;
-    void put_locked(const std::string& internal_key, const AttributeMap& attributes);
-    void remove_locked(const std::string& internal_key);
+    // put_locked/remove_locked append the record to the WAL (without fsync) and update
+    // the memtable under mutex_, then return the WAL the record went to. The caller
+    // commits that WAL *after releasing mutex_*, so the fsync no longer blocks readers.
+    std::shared_ptr<WriteAheadLog> put_locked(const std::string& internal_key, const AttributeMap& attributes);
+    std::shared_ptr<WriteAheadLog> remove_locked(const std::string& internal_key);
 
     void flush_memtable();
     void background_compaction();
     // Merges every on-disk SSTable into a single one (newest-wins, tombstones
-    // purged), bounding read amplification and disk usage. Must be called with
-    // mutex_ held exclusively.
-    void compact_locked();
+    // purged), bounding read amplification and disk usage. Does its own locking in
+    // phases: it snapshots the SSTable set under the lock, performs the merge + file
+    // write UNLOCKED (like flush_memtable), then re-locks only to swap the manifest,
+    // preserving any SSTables flushed concurrently. Must NOT be called with mutex_ held.
+    void compact();
     std::string get_table_path(const std::string& table_name) const;
     // Merged, tombstone-resolved, sorted snapshot across all levels. Caller must hold
     // mutex_ (shared is sufficient). When `prefix` is non-empty the result is bounded
@@ -85,7 +90,9 @@ private:
     std::thread flush_thread_;
     std::thread compaction_thread_;
 
-    std::unique_ptr<WriteAheadLog> wal_;
+    // shared_ptr so an in-flight writer can commit (fsync) the exact WAL its record
+    // went to after releasing mutex_, even if the engine rotates to a new WAL meanwhile.
+    std::shared_ptr<WriteAheadLog> wal_;
     std::shared_ptr<Manifest> manifest_;
     std::unique_ptr<CompactionManager> compaction_manager_;
     
