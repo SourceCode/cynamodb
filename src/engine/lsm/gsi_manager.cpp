@@ -1,5 +1,6 @@
 #include <cynamodb/engine/lsm/gsi_manager.hpp>
 #include <chrono>
+#include <thread>
 
 namespace cynamodb::engine::lsm {
 
@@ -27,8 +28,17 @@ void GsiManager::remove_gsi_storage(const std::string& table_name, const std::st
 }
 
 void GsiManager::queue_update(GSIUpdate update) {
-    while (!queue_.enqueue(std::move(update))) {
-        std::this_thread::yield();
+    // Bounded backoff rather than a bare yield()-spin: if the ring is full and the
+    // propagation worker is slow, an unbounded spin would peg a core. Yield briefly for
+    // the common short wait, then fall back to a small capped sleep so a stalled
+    // consumer can't be turned into a 100%-CPU spin. (This path is currently unused —
+    // GSI propagation is not yet wired up — but hardened so wiring it up is safe.)
+    for (int spins = 0; !queue_.enqueue(std::move(update)); ++spins) {
+        if (spins < 128) {
+            std::this_thread::yield();
+        } else {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
     }
 }
 

@@ -4,6 +4,17 @@ All notable changes to cynamoDB are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/) and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [2.5.3] - 2026-07-07
+
+### Fixed
+- **GSI propagation enqueue could busy-spin.** `GsiManager::queue_update` waited on a
+  full ring buffer with a bare `std::this_thread::yield()` loop, which would peg a core
+  if the queue filled and the propagation worker fell behind. Replaced with a bounded
+  backoff (brief yielding, then a small capped sleep). This path is currently unused
+  (GSI propagation is not yet wired up), so it is defensive hardening rather than a live
+  bug fix — closing the last item from the 2.5.1 concurrency audit.
+  (`src/engine/lsm/gsi_manager.cpp`)
+
 ## [2.5.2] - 2026-07-06
 
 Follow-through on the two concurrency hot spots documented in 2.5.1: the engine's
