@@ -5,8 +5,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -15,6 +17,21 @@ using namespace cynamodb::engine::lsm;
 using namespace cynamodb::core;
 
 namespace {
+
+struct ScopedEnv {
+    std::string name;
+    std::optional<std::string> previous;
+
+    ScopedEnv(std::string n, std::string value) : name(std::move(n)) {
+        if (const char* old = std::getenv(name.c_str())) previous = old;
+        setenv(name.c_str(), value.c_str(), 1);
+    }
+
+    ~ScopedEnv() {
+        if (previous) setenv(name.c_str(), previous->c_str(), 1);
+        else unsetenv(name.c_str());
+    }
+};
 
 std::shared_ptr<AttributeValue> S(std::string_view s) {
     auto av = std::make_shared<AttributeValue>();
@@ -309,6 +326,7 @@ TEST_CASE("LsmEngine stays correct under heavy load across many flushes", "[lsm]
 }
 
 TEST_CASE("LsmEngine compaction bounds file count and preserves correctness", "[lsm][engine][compaction]") {
+    ScopedEnv enable_compaction("CYNAMODB_ENABLE_AUTO_COMPACTION", "1");
     TempDir dir;
     const std::string T = "T";
     const int N = 8000;  // 8 flushes; without compaction that is 8+ SSTables

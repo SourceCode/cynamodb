@@ -4,6 +4,7 @@
 #include <cynamodb/engine/lsm/manifest.hpp>
 #include <cynamodb/engine/lsm/record_codec.hpp>
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <map>
@@ -68,6 +69,13 @@ bool item_matches(const StorageEngine::AttributeMap& item,
         }
     }
     return true;
+}
+
+bool auto_compaction_enabled() {
+    const char* enabled = std::getenv("CYNAMODB_ENABLE_AUTO_COMPACTION");
+    if (!enabled) return false;
+    const std::string_view flag(enabled);
+    return flag == "1" || flag == "true" || flag == "on";
 }
 
 }  // namespace
@@ -459,7 +467,7 @@ void LsmEngine::flush_memtable() {
             manifest_->save();
             sstables_.push_front(std::make_shared<SSTable>(sst_path));
             immutable_memtables_.erase(immutable_memtables_.begin());
-            if (compaction_manager_->should_compact_L0()) {
+            if (auto_compaction_enabled() && compaction_manager_->should_compact_L0()) {
                 compaction_pending_ = true;
                 compaction_cv_.notify_one();
             }
