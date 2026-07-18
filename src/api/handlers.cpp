@@ -20,7 +20,11 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 
 namespace cynamodb::api {
 
@@ -33,6 +37,19 @@ using MutationKind = engine::StorageEngine::MutationKind;
 
 ApiResult ok(std::string body) {
     return ApiResult{200, "", std::move(body)};
+}
+
+void trim_heap_after_bulk_read() {
+#ifdef __GLIBC__
+    const char* disabled = std::getenv("CYNAMODB_DISABLE_MALLOC_TRIM");
+    if (disabled) {
+        const std::string_view flag(disabled);
+        if (flag == "1" || flag == "true" || flag == "on") {
+            return;
+        }
+    }
+    malloc_trim(0);
+#endif
 }
 
 ApiResult error(unsigned status, const std::string& type, const std::string& message) {
@@ -1237,6 +1254,9 @@ ApiResult handle_scan(engine::TableManager& tables, engine::StorageEngine& stora
            ",\"ScannedCount\":" + std::to_string(scanned);
     if (last_evaluated) out += ",\"LastEvaluatedKey\":" + *last_evaluated;
     out += "}";
+    output.clear();
+    output.shrink_to_fit();
+    trim_heap_after_bulk_read();
     return ok(std::move(out));
 }
 
@@ -1356,6 +1376,13 @@ ApiResult handle_index_query(engine::StorageEngine& storage,
            ",\"ScannedCount\":" + std::to_string(examined);
     if (last_evaluated) out += ",\"LastEvaluatedKey\":" + *last_evaluated;
     out += "}";
+    output.clear();
+    output.shrink_to_fit();
+    matched.clear();
+    matched.shrink_to_fit();
+    result.items.clear();
+    result.items.shrink_to_fit();
+    trim_heap_after_bulk_read();
     return ok(std::move(out));
 }
 
@@ -1511,6 +1538,13 @@ ApiResult handle_query(engine::TableManager& tables, engine::StorageEngine& stor
         out += ",\"LastEvaluatedKey\":" + *last_evaluated;
     }
     out += "}";
+    output.clear();
+    output.shrink_to_fit();
+    matched.clear();
+    matched.shrink_to_fit();
+    result.items.clear();
+    result.items.shrink_to_fit();
+    trim_heap_after_bulk_read();
     return ok(std::move(out));
 }
 
