@@ -1302,34 +1302,8 @@ ApiResult handle_index_query(engine::StorageEngine& storage,
     const std::string storage_tbl = index_storage_table(def.table_name, index_name);
     AttributeMap pk_condition;
     pk_condition[parsed.pk_name] = parsed.pk_value;
-    auto result = storage.query(storage_tbl, pk_condition, std::nullopt, 0, encode_key_prefix(parsed.pk_value));
-
     bool forward = true;
     auto sif_rc = doc["ScanIndexForward"].get_bool().get(forward); (void)sif_rc;
-
-    std::vector<AttributeMap> matched;
-    for (auto& item : result.items) {
-        if (parsed.sort.present) {
-            auto it = item.find(parsed.sk_name);
-            if (it == item.end() || !sort_matches(it->second, parsed.sort)) continue;
-        }
-        matched.push_back(std::move(item));
-    }
-    if (!forward) std::reverse(matched.begin(), matched.end());
-
-    // ExclusiveStartKey carries the index + base key attributes.
-    size_t begin_idx = 0;
-    simdjson::dom::element esk_el;
-    if (doc["ExclusiveStartKey"].get(esk_el) == simdjson::SUCCESS) {
-        if (auto esk_map = parse_attribute_map(esk_el)) {
-            std::string esk = encode_index_storage_key(*idx, def, *esk_map);
-            for (; begin_idx < matched.size(); ++begin_idx) {
-                std::string ek = encode_index_storage_key(*idx, def, matched[begin_idx]);
-                bool past = forward ? (ek > esk) : (ek < esk);
-                if (past) break;
-            }
-        }
-    }
 
     size_t limit = read_limit(doc).value_or(0);
     std::string_view filter_view;
@@ -1341,6 +1315,44 @@ ApiResult handle_index_query(engine::StorageEngine& storage,
     const int select_count = read_select_count(doc, has_projection, select_msg);
     if (select_count < 0) return error(400, "ValidationException", select_msg);
     const bool count_only = select_count == 1;
+
+    std::optional<std::string> storage_start;
+    if (forward && !parsed.sort.present) {
+        simdjson::dom::element esk_el;
+        if (doc["ExclusiveStartKey"].get(esk_el) == simdjson::SUCCESS) {
+            if (auto esk_map = parse_attribute_map(esk_el)) {
+                storage_start = encode_index_storage_key(*idx, def, *esk_map);
+            }
+        }
+    }
+    const size_t storage_limit = (forward && !parsed.sort.present) ? limit : 0;
+    auto result = storage.query(storage_tbl, pk_condition, storage_start, storage_limit, encode_key_prefix(parsed.pk_value));
+
+    std::vector<AttributeMap> matched;
+    for (auto& item : result.items) {
+        if (parsed.sort.present) {
+            auto it = item.find(parsed.sk_name);
+            if (it == item.end() || !sort_matches(it->second, parsed.sort)) continue;
+        }
+        matched.push_back(std::move(item));
+    }
+    if (!forward) std::reverse(matched.begin(), matched.end());
+
+    // ExclusiveStartKey carries the index + base key attributes. When the storage
+    // layer can apply it safely, begin_idx stays at zero and no full partition walk
+    // is needed for common GSI polling paths.
+    size_t begin_idx = 0;
+    simdjson::dom::element esk_el;
+    if (!storage_start && doc["ExclusiveStartKey"].get(esk_el) == simdjson::SUCCESS) {
+        if (auto esk_map = parse_attribute_map(esk_el)) {
+            std::string esk = encode_index_storage_key(*idx, def, *esk_map);
+            for (; begin_idx < matched.size(); ++begin_idx) {
+                std::string ek = encode_index_storage_key(*idx, def, matched[begin_idx]);
+                bool past = forward ? (ek > esk) : (ek < esk);
+                if (past) break;
+            }
+        }
+    }
 
     std::vector<AttributeMap> output;
     size_t matched_count = 0;
@@ -1368,6 +1380,9 @@ ApiResult handle_index_query(engine::StorageEngine& storage,
         } else {
             output.push_back(item);
         }
+    }
+    if (!last_evaluated && result.last_evaluated_key && !matched.empty()) {
+        last_evaluated = index_key_only_json(*idx, def, matched.back());
     }
 
     std::string out = "{";
@@ -1467,7 +1482,21 @@ ApiResult handle_query(engine::TableManager& tables, engine::StorageEngine& stor
         auto parsed = parse_key_condition(std::string(kce_view), names, *values_opt);
         if (parsed.ok) storage_prefix = encode_key_prefix(parsed.pk_value);
     }
-    auto result = storage.query(std::string(name), pk_condition, std::nullopt, 0, storage_prefix);
+    size_t limit = read_limit(doc).value_or(0);
+    std::string_view filter_view;
+    const bool has_filter = doc["FilterExpression"].get_string().get(filter_view) == simdjson::SUCCESS;
+    const std::string filter(filter_view);
+    std::string_view projection_view;
+    const bool has_projection = doc["ProjectionExpression"].get_string().get(projection_view) == simdjson::SUCCESS;
+    std::string select_msg;
+    const int select_count = read_select_count(doc, has_projection, select_msg);
+    if (select_count < 0) return error(400, "ValidationException", select_msg);
+    const bool count_only = select_count == 1;
+
+    std::optional<std::string> storage_start;
+    if (forward && !sort.present) storage_start = read_start_key(doc, *def);
+    const size_t storage_limit = (forward && !sort.present) ? limit : 0;
+    auto result = storage.query(std::string(name), pk_condition, storage_start, storage_limit, storage_prefix);
     std::vector<AttributeMap> matched;
     for (auto& item : result.items) {
         if (item_is_expired(*def, item)) continue;  // TTL: expired items are not returned
@@ -1480,7 +1509,7 @@ ApiResult handle_query(engine::TableManager& tables, engine::StorageEngine& stor
     if (!forward) std::reverse(matched.begin(), matched.end());
 
     // ExclusiveStartKey: skip everything up to and including the supplied key.
-    auto esk = read_start_key(doc, *def);
+    auto esk = storage_start ? std::nullopt : read_start_key(doc, *def);
     size_t begin_idx = 0;
     if (esk) {
         for (; begin_idx < matched.size(); ++begin_idx) {
@@ -1489,17 +1518,6 @@ ApiResult handle_query(engine::TableManager& tables, engine::StorageEngine& stor
             if (past) break;
         }
     }
-
-    size_t limit = read_limit(doc).value_or(0);
-    std::string_view filter_view;
-    const bool has_filter = doc["FilterExpression"].get_string().get(filter_view) == simdjson::SUCCESS;
-    const std::string filter(filter_view);
-    std::string_view projection_view;
-    const bool has_projection = doc["ProjectionExpression"].get_string().get(projection_view) == simdjson::SUCCESS;
-    std::string select_msg;
-    const int select_count = read_select_count(doc, has_projection, select_msg);
-    if (select_count < 0) return error(400, "ValidationException", select_msg);
-    const bool count_only = select_count == 1;
 
     std::vector<AttributeMap> output;
     size_t matched_count = 0;
@@ -1528,6 +1546,9 @@ ApiResult handle_query(engine::TableManager& tables, engine::StorageEngine& stor
         } else {
             output.push_back(item);
         }
+    }
+    if (!last_evaluated && result.last_evaluated_key && !matched.empty()) {
+        last_evaluated = key_only_json(*def, matched.back());
     }
 
     std::string out = "{";
