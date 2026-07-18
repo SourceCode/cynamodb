@@ -297,6 +297,13 @@ std::string encode_index_storage_key(const IndexSpec& idx, const core::TableDefi
     return out;
 }
 
+std::string encode_key_prefix(const std::shared_ptr<core::AttributeValue>& value) {
+    std::string out;
+    if (value) engine::encode_key_component(out, *value);
+    else { out.push_back('\0'); out.push_back('\0'); }
+    return out;
+}
+
 // Projects an item into an index entry, or nullopt if the item lacks the index key
 // attributes (a sparse index simply omits such items).
 std::optional<AttributeMap> project_for_index(const AttributeMap& item, const IndexSpec& idx,
@@ -1275,7 +1282,7 @@ ApiResult handle_index_query(engine::StorageEngine& storage,
     const std::string storage_tbl = index_storage_table(def.table_name, index_name);
     AttributeMap pk_condition;
     pk_condition[parsed.pk_name] = parsed.pk_value;
-    auto result = storage.query(storage_tbl, pk_condition, std::nullopt, 0);
+    auto result = storage.query(storage_tbl, pk_condition, std::nullopt, 0, encode_key_prefix(parsed.pk_value));
 
     bool forward = true;
     auto sif_rc = doc["ScanIndexForward"].get_bool().get(forward); (void)sif_rc;
@@ -1383,6 +1390,10 @@ ApiResult handle_query(engine::TableManager& tables, engine::StorageEngine& stor
         auto parsed = parse_key_condition(std::string(kce_view), names, *values_opt);
         if (!parsed.ok) return error(400, "ValidationException",
                                      parsed.error.empty() ? "Invalid KeyConditionExpression" : parsed.error);
+        if (def->key_schema.empty() || parsed.pk_name != def->key_schema[0].attribute_name) {
+            return error(400, "ValidationException",
+                         "KeyConditionExpression partition key must be the table hash key");
+        }
         pk_condition[parsed.pk_name] = parsed.pk_value;
         sort = parsed.sort;
         sk_name = parsed.sk_name;
@@ -1424,7 +1435,12 @@ ApiResult handle_query(engine::TableManager& tables, engine::StorageEngine& stor
 
     // Fetch the whole partition (ascending), then apply sort condition, ordering,
     // pagination, filter, projection and limit at the handler level.
-    auto result = storage.query(std::string(name), pk_condition, std::nullopt, 0);
+    std::optional<std::string> storage_prefix;
+    if (doc["KeyConditionExpression"].get_string().get(kce_view) == simdjson::SUCCESS) {
+        auto parsed = parse_key_condition(std::string(kce_view), names, *values_opt);
+        if (parsed.ok) storage_prefix = encode_key_prefix(parsed.pk_value);
+    }
+    auto result = storage.query(std::string(name), pk_condition, std::nullopt, 0, storage_prefix);
     std::vector<AttributeMap> matched;
     for (auto& item : result.items) {
         if (item_is_expired(*def, item)) continue;  // TTL: expired items are not returned

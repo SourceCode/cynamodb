@@ -28,7 +28,12 @@ public:
     void drop_table(const std::string& table_name) override;
 
     ScanResult scan(const std::string& table_name, const std::optional<std::string>& exclusive_start_key, size_t limit) override;
-    QueryResult query(const std::string& table_name, const AttributeMap& key_conditions, const std::optional<std::string>& exclusive_start_key, size_t limit) override;
+    QueryResult query(
+        const std::string& table_name,
+        const AttributeMap& key_conditions,
+        const std::optional<std::string>& exclusive_start_key,
+        size_t limit,
+        const std::optional<std::string>& key_prefix = std::nullopt) override;
 
 private:
     // Lock-free building blocks; the caller must already hold mutex_ exclusively.

@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include <cynamodb/engine/lsm/lsm_engine.hpp>
+#include <cynamodb/engine/key_codec.hpp>
 #include <cynamodb/core/memory.hpp>
 
 #include <atomic>
@@ -135,6 +136,30 @@ TEST_CASE("LsmEngine query filters by equality", "[lsm][engine][query]") {
     REQUIRE(result.items.size() == 2);
     REQUIRE(get_s(result.items[0], "data") == "a");
     REQUIRE(get_s(result.items[1], "data") == "c");
+}
+
+TEST_CASE("LsmEngine query can seek by encoded partition prefix", "[lsm][engine][query][prefix]") {
+    TempDir dir;
+    auto arena = std::make_shared<Arena>();
+    LsmEngine engine(dir.path.string(), arena);
+    const std::string table = "T";
+
+    std::string x_prefix;
+    encode_key_component(x_prefix, *S("x"));
+    std::string y_prefix;
+    encode_key_component(y_prefix, *S("y"));
+
+    engine.put(table, x_prefix + "001", make_item("x", "x-1"));
+    engine.put(table, x_prefix + "002", make_item("x", "x-2"));
+    engine.put(table, y_prefix + "001", make_item("x", "wrong-prefix"));
+
+    StorageEngine::AttributeMap cond;
+    cond["grp"] = S("x");
+    auto result = engine.query(table, cond, std::nullopt, 0, x_prefix);
+
+    REQUIRE(result.items.size() == 2);
+    REQUIRE(get_s(result.items[0], "data") == "x-1");
+    REQUIRE(get_s(result.items[1], "data") == "x-2");
 }
 
 TEST_CASE("LsmEngine isolates tables sharing the same key", "[lsm][engine][multitable]") {

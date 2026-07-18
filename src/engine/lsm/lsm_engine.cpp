@@ -389,17 +389,23 @@ LsmEngine::ScanResult LsmEngine::scan(const std::string& table_name, const std::
     return result;
 }
 
-LsmEngine::QueryResult LsmEngine::query(const std::string& table_name, const AttributeMap& key_conditions, const std::optional<std::string>& exclusive_start_key, size_t limit) {
+LsmEngine::QueryResult LsmEngine::query(
+    const std::string& table_name,
+    const AttributeMap& key_conditions,
+    const std::optional<std::string>& exclusive_start_key,
+    size_t limit,
+    const std::optional<std::string>& key_prefix) {
     QueryResult result;
     std::shared_lock lock(mutex_);
     const std::string prefix = table_prefix(table_name);
-    auto live = materialize(prefix);
+    const std::string query_prefix = key_prefix ? prefix + *key_prefix : prefix;
+    auto live = materialize(query_prefix);
 
     auto it = exclusive_start_key ? live.upper_bound(prefix + *exclusive_start_key)
-                                   : live.lower_bound(prefix);
+                                   : live.lower_bound(query_prefix);
     std::string last_user_key;
     for (; it != live.end(); ++it) {
-        if (it->first.compare(0, prefix.size(), prefix) != 0) break;  // left this table
+        if (it->first.compare(0, query_prefix.size(), query_prefix) != 0) break;  // left this query range
         if (!item_matches(it->second, key_conditions)) continue;
         if (limit != 0 && result.items.size() == limit) {
             result.last_evaluated_key = last_user_key;

@@ -57,7 +57,12 @@ public:
     virtual void drop_table(const std::string& table_name) = 0;
 
     virtual ScanResult scan(const std::string& table_name, const std::optional<std::string>& exclusive_start_key, size_t limit) = 0;
-    virtual QueryResult query(const std::string& table_name, const AttributeMap& key_conditions, const std::optional<std::string>& exclusive_start_key, size_t limit) = 0;
+    virtual QueryResult query(
+        const std::string& table_name,
+        const AttributeMap& key_conditions,
+        const std::optional<std::string>& exclusive_start_key,
+        size_t limit,
+        const std::optional<std::string>& key_prefix = std::nullopt) = 0;
 };
 
 } // namespace cynamodb::engine

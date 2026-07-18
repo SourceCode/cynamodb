@@ -27,7 +27,12 @@ public:
     void drop_table(const std::string& table_name) override;
 
     ScanResult scan(const std::string& table_name, const std::optional<std::string>& exclusive_start_key, size_t limit) override;
-    QueryResult query(const std::string& table_name, const AttributeMap& key_conditions, const std::optional<std::string>& exclusive_start_key, size_t limit) override;
+    QueryResult query(
+        const std::string& table_name,
+        const AttributeMap& key_conditions,
+        const std::optional<std::string>& exclusive_start_key,
+        size_t limit,
+        const std::optional<std::string>& key_prefix = std::nullopt) override;
 
     // Legacy methods
     std::expected<void, StorageError> put_item(const core::TableDefinition& table_def, const Item& item);

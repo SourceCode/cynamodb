@@ -127,7 +127,12 @@ MemoryEngine::ScanResult MemoryEngine::scan(const std::string& table_name, const
     return result;
 }
 
-MemoryEngine::QueryResult MemoryEngine::query(const std::string& table_name, const AttributeMap& key_conditions, const std::optional<std::string>& exclusive_start_key, size_t limit) {
+MemoryEngine::QueryResult MemoryEngine::query(
+    const std::string& table_name,
+    const AttributeMap& key_conditions,
+    const std::optional<std::string>& exclusive_start_key,
+    size_t limit,
+    const std::optional<std::string>& key_prefix) {
     QueryResult result;
     std::shared_lock lock(mutex_);
     auto table_it = data_.find(table_name);
@@ -136,13 +141,16 @@ MemoryEngine::QueryResult MemoryEngine::query(const std::string& table_name, con
     }
     const auto& items = table_it->second;
 
-    auto it = items.begin();
+    auto it = key_prefix ? items.lower_bound(*key_prefix) : items.begin();
     if (exclusive_start_key) {
         it = items.upper_bound(*exclusive_start_key);
     }
 
     std::string last_key;
     for (; it != items.end(); ++it) {
+        if (key_prefix && it->first.compare(0, key_prefix->size(), *key_prefix) != 0) {
+            break;
+        }
         if (!item_matches_conditions(it->second, key_conditions)) {
             continue;
         }
