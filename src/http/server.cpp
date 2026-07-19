@@ -7,6 +7,23 @@
 #include <iostream>
 #include <random>
 #include <string>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
+
+namespace {
+
+constexpr size_t kHeapTrimResponseThreshold = 1024U * 1024U;
+
+void trim_heap_after_completed_bulk_response(bool should_trim) {
+#ifdef __GLIBC__
+    if (should_trim) malloc_trim(0);
+#else
+    (void)should_trim;
+#endif
+}
+
+} // namespace
 
 namespace cynamodb::http {
 
@@ -97,7 +114,7 @@ void HttpSession::on_read(beast::error_code ec, std::size_t bytes_transferred) {
 
 void HttpSession::handle_request() {
     http::response<http::string_body> res{http::status::ok, req_.version()};
-    res.set(http::field::server, "cynamoDB/2.5.3");
+    res.set(http::field::server, "cynamoDB/2.5.4");
 
     // Echo the DynamoDB JSON protocol version the client used (1.0 or 1.1); default
     // to 1.0. Input is otherwise content-type-lenient, matching AWS.
@@ -215,10 +232,19 @@ std::optional<api::ApiResult> HttpSession::check_auth() {
 }
 
 void HttpSession::do_write(http::response<http::string_body> res) {
+    const bool should_trim = res.body().capacity() >= kHeapTrimResponseThreshold ||
+                             req_.body().capacity() >= kHeapTrimResponseThreshold;
     auto sp = std::make_shared<http::response<http::string_body>>(std::move(res));
     http::async_write(stream_, *sp,
-                      [self = shared_from_this(), sp](beast::error_code ec, std::size_t bytes) {
-                          self->on_write(ec, bytes, sp->need_eof());
+                      [self = shared_from_this(), sp, should_trim]
+                      (beast::error_code ec, std::size_t bytes) mutable {
+                          const bool close = sp->need_eof();
+                          sp.reset();
+                          self->on_write(ec, bytes, close);
+                          // on_write starts the next read, which clears req_; the response
+                          // holder above is also gone. This is the first point where a trim
+                          // can release the bulk-read high-water allocation.
+                          trim_heap_after_completed_bulk_response(should_trim);
                       });
 }
 
@@ -226,6 +252,8 @@ void HttpSession::on_write(beast::error_code ec, std::size_t bytes_transferred, 
     (void)bytes_transferred;
     if (ec) return;
     if (close) {
+        req_ = {};
+        buffer_.consume(buffer_.size());
         stream_.socket().shutdown(tcp::socket::shutdown_send, ec);
         return;
     }

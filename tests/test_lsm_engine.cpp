@@ -7,6 +7,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -135,6 +137,23 @@ TEST_CASE("LsmEngine scan returns sorted live items and excludes tombstones", "[
         } while (cursor.has_value());
         REQUIRE(all == std::vector<std::string>{"a", "c", "d"});
     }
+}
+
+TEST_CASE("LsmEngine read pages are bounded by data size", "[lsm][engine][pagination][memory]") {
+    TempDir dir;
+    auto arena = std::make_shared<Arena>();
+    LsmEngine engine(dir.path.string(), arena);
+    const std::string payload(300 * 1024, 'x');
+    for (int i = 0; i < 4; ++i) {
+        engine.put("T", "k" + std::to_string(i), make_item("g", payload));
+    }
+
+    auto first = engine.scan("T", std::nullopt, 0);
+    REQUIRE(first.items.size() == 3);
+    REQUIRE(first.last_evaluated_key.has_value());
+    auto final = engine.scan("T", first.last_evaluated_key, 0);
+    REQUIRE(final.items.size() == 1);
+    REQUIRE_FALSE(final.last_evaluated_key.has_value());
 }
 
 TEST_CASE("LsmEngine query filters by equality", "[lsm][engine][query]") {
@@ -278,6 +297,51 @@ TEST_CASE("LsmEngine persists flushed SSTables and the unflushed tail across a r
     }
 }
 
+TEST_CASE("LsmEngine removes only unreferenced SSTables on startup", "[lsm][engine][recovery]") {
+    ScopedEnv compaction("CYNAMODB_ENABLE_AUTO_COMPACTION", "0");
+    TempDir dir;
+    {
+        auto arena = std::make_shared<Arena>();
+        LsmEngine engine(dir.path.string(), arena);
+        for (int i = 0; i < 1000; ++i) {
+            engine.put("T", "k" + std::to_string(i), make_item("g", "persisted"));
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (count_sstables(dir.path) == 0 && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        REQUIRE(count_sstables(dir.path) == 1);
+    }
+
+    const auto orphan = dir.path / "orphan.sst";
+    {
+        std::ofstream output(orphan, std::ios::binary);
+        output << "not referenced by the manifest";
+    }
+    REQUIRE(std::filesystem::exists(orphan));
+
+    auto arena = std::make_shared<Arena>();
+    LsmEngine restarted(dir.path.string(), arena);
+    REQUIRE_FALSE(std::filesystem::exists(orphan));
+    REQUIRE(restarted.get("T", "k0").has_value());
+    REQUIRE(count_sstables(dir.path) == 1);
+}
+
+TEST_CASE("LsmEngine rejects corrupt manifest counts without allocation", "[lsm][engine][recovery]") {
+    TempDir dir;
+    std::filesystem::create_directories(dir.path);
+    {
+        std::ofstream manifest(dir.path / "MANIFEST", std::ios::binary);
+        const uint64_t sequence = 1;
+        const uint32_t impossible_levels = std::numeric_limits<uint32_t>::max();
+        manifest.write(reinterpret_cast<const char*>(&sequence), sizeof(sequence));
+        manifest.write(reinterpret_cast<const char*>(&impossible_levels), sizeof(impossible_levels));
+    }
+
+    auto arena = std::make_shared<Arena>();
+    REQUIRE_THROWS_AS(LsmEngine(dir.path.string(), arena), std::runtime_error);
+}
+
 TEST_CASE("LsmEngine stays correct under heavy load across many flushes", "[lsm][engine][stress]") {
     TempDir dir;
     auto arena = std::make_shared<Arena>();
@@ -391,6 +455,71 @@ TEST_CASE("LsmEngine compaction bounds file count and preserves correctness", "[
         REQUIRE(!engine.get(T, key(1500)).has_value());
         REQUIRE(get_s(*engine.get(T, key(0)), "data") == "0");
     }
+}
+
+TEST_CASE("size-tiered compaction never crosses an intervening sequence",
+          "[lsm][engine][compaction][precedence]") {
+    ScopedEnv compaction("CYNAMODB_ENABLE_AUTO_COMPACTION", "0");
+    ScopedEnv no_fsync("CYNAMODB_WAL_FSYNC", "0");
+    TempDir dir;
+
+    auto wait_for_files = [&](size_t minimum) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (count_sstables(dir.path) < minimum && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        REQUIRE(count_sstables(dir.path) >= minimum);
+    };
+
+    {
+        auto arena = std::make_shared<Arena>();
+        LsmEngine engine(dir.path.string(), arena);
+        auto flush_group = [&](int group, size_t payload_size, bool writes_shared) {
+            const int fillers = writes_shared ? 999 : 1000;
+            if (writes_shared) {
+                engine.put("T", "shared", make_item("g", group == 0 ? "old" : "new"));
+            }
+            const std::string payload(payload_size, static_cast<char>('a' + group));
+            for (int i = 0; i < fillers; ++i) {
+                char key[32];
+                std::snprintf(key, sizeof(key), "g%02d-k%04d", group, i);
+                engine.put("T", key, make_item("g", payload));
+            }
+        };
+
+        // Two small files contain the old value, then a different size tier contains
+        // the newer value, followed by another small-file run. A non-contiguous
+        // same-tier merge would promote the old value above the intervening file.
+        flush_group(0, 32, true);
+        wait_for_files(1);
+        flush_group(1, 32, false);
+        wait_for_files(2);
+        flush_group(2, 8192, true);
+        wait_for_files(3);
+        flush_group(3, 32, false);
+        wait_for_files(4);
+        flush_group(4, 32, false);
+        wait_for_files(5);
+
+        setenv("CYNAMODB_ENABLE_AUTO_COMPACTION", "1", 1);
+        flush_group(5, 32, false);
+        wait_for_files(6);
+        flush_group(6, 32, false);
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        while (count_sstables(dir.path) > 4 && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        auto shared = engine.get("T", "shared");
+        REQUIRE(shared.has_value());
+        REQUIRE(get_s(*shared, "data") == "new");
+    }
+
+    auto arena = std::make_shared<Arena>();
+    LsmEngine restarted(dir.path.string(), arena);
+    auto shared = restarted.get("T", "shared");
+    REQUIRE(shared.has_value());
+    REQUIRE(get_s(*shared, "data") == "new");
 }
 
 TEST_CASE("LsmEngine reads correctly across a flushed SSTable", "[lsm][engine][flush]") {

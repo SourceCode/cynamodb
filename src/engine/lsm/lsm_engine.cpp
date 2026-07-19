@@ -4,13 +4,19 @@
 #include <cynamodb/engine/lsm/manifest.hpp>
 #include <cynamodb/engine/lsm/record_codec.hpp>
 #include <algorithm>
+#include <bit>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 #include <map>
+#include <queue>
 #include <set>
+#include <stdexcept>
 #include <string_view>
-#include <variant>
 #include <vector>
 
 namespace cynamodb::engine::lsm {
@@ -38,10 +44,7 @@ std::string table_prefix(const std::string& table) {
 
 // True if the key is present in this SSTable's sorted index.
 bool sstable_contains(SSTable& sstable, const std::string& key) {
-    const auto& idx = sstable.index();
-    auto it = std::lower_bound(idx.begin(), idx.end(), key,
-        [](const SSTable::IndexEntry& a, const std::string& b) { return a.key < b; });
-    return it != idx.end() && it->key == key;
+    return sstable.contains(key);
 }
 
 bool attribute_equals(const core::AttributeValue& a, const core::AttributeValue& b) {
@@ -73,9 +76,201 @@ bool item_matches(const StorageEngine::AttributeMap& item,
 
 bool auto_compaction_enabled() {
     const char* enabled = std::getenv("CYNAMODB_ENABLE_AUTO_COMPACTION");
-    if (!enabled) return false;
+    if (!enabled) return true;
     const std::string_view flag(enabled);
-    return flag == "1" || flag == "true" || flag == "on";
+    return flag != "0" && flag != "false" && flag != "off";
+}
+
+void trim_free_heap_after_compaction() {
+#ifdef __GLIBC__
+    malloc_trim(0);
+#endif
+}
+
+using SnapshotMap = std::map<std::string, Skiplist::SnapshotEntry, core::StringViewLess>;
+
+// K-way merge over mutable snapshots and immutable SSTable indexes. Only one key per
+// source is retained in the heap, so memory is O(number of files + active memtables),
+// independent of the number or size of records in the requested range.
+class MergedReader {
+public:
+    struct Row {
+        std::string key;
+        StorageEngine::AttributeMap attributes;
+    };
+
+    MergedReader(std::vector<SnapshotMap> memory_snapshots,
+                 const std::deque<std::shared_ptr<SSTable>>& sstables,
+                 std::string prefix,
+                 std::optional<std::string> exclusive_start,
+                 bool scan_forward = true)
+        : prefix_(std::move(prefix)), scan_forward_(scan_forward),
+          heap_(NodeOrder{scan_forward}) {
+        const std::optional<std::string> upper = prefix_successor(prefix_);
+        sources_.reserve(memory_snapshots.size() + sstables.size());
+        size_t rank = 0;
+        for (auto& snapshot : memory_snapshots) {
+            Source source;
+            source.rank = rank++;
+            source.memory = std::make_shared<SnapshotMap>(std::move(snapshot));
+            if (scan_forward_) {
+                source.memory_it = exclusive_start ? source.memory->upper_bound(*exclusive_start)
+                                                   : source.memory->lower_bound(prefix_);
+                source.memory_valid = source.memory_it != source.memory->end();
+            } else {
+                auto after = exclusive_start ? source.memory->lower_bound(*exclusive_start)
+                                             : (upper ? source.memory->lower_bound(*upper)
+                                                      : source.memory->end());
+                if (after != source.memory->begin()) {
+                    source.memory_it = std::prev(after);
+                    source.memory_valid = true;
+                }
+            }
+            sources_.push_back(std::move(source));
+            enqueue(sources_.size() - 1);
+        }
+        for (const auto& sstable : sstables) {
+            Source source;
+            source.rank = rank++;
+            source.sstable = sstable;
+            if (scan_forward_) {
+                source.sstable_position = exclusive_start
+                    ? sstable->upper_bound_index(*exclusive_start)
+                    : sstable->lower_bound_index(prefix_);
+                source.sstable_valid = source.sstable_position < sstable->entry_count();
+            } else {
+                const size_t after = exclusive_start
+                    ? sstable->lower_bound_index(*exclusive_start)
+                    : (upper ? sstable->lower_bound_index(*upper) : sstable->entry_count());
+                if (after > 0) {
+                    source.sstable_position = after - 1;
+                    source.sstable_valid = true;
+                }
+            }
+            sources_.push_back(std::move(source));
+            enqueue(sources_.size() - 1);
+        }
+    }
+
+    std::optional<Row> next() {
+        while (!heap_.empty()) {
+            const std::string key = heap_.top().key;
+            std::vector<Node> same_key;
+            do {
+                same_key.push_back(heap_.top());
+                heap_.pop();
+            } while (!heap_.empty() && heap_.top().key == key);
+
+            auto winner = std::min_element(same_key.begin(), same_key.end(),
+                [](const Node& a, const Node& b) { return a.rank < b.rank; });
+            auto entry = read_current(sources_[winner->source]);
+            for (const Node& node : same_key) {
+                advance(node.source);
+            }
+            if (!entry) {
+                throw std::runtime_error("failed to decode indexed SSTable record for merged read");
+            }
+            if (entry->is_deleted) continue;
+            return Row{key, std::move(entry->attributes)};
+        }
+        return std::nullopt;
+    }
+
+private:
+    struct Source {
+        size_t rank = 0;
+        std::shared_ptr<SnapshotMap> memory;
+        SnapshotMap::const_iterator memory_it;
+        bool memory_valid = false;
+        std::shared_ptr<SSTable> sstable;
+        size_t sstable_position = 0;
+        bool sstable_valid = false;
+    };
+
+    struct Node {
+        std::string key;
+        size_t source = 0;
+        size_t rank = 0;
+    };
+
+    struct NodeOrder {
+        bool scan_forward = true;
+        bool operator()(const Node& left, const Node& right) const {
+            if (left.key != right.key) {
+                return scan_forward ? left.key > right.key : left.key < right.key;
+            }
+            return left.rank > right.rank;
+        }
+    };
+
+    static std::optional<std::string> prefix_successor(std::string prefix) {
+        for (size_t i = prefix.size(); i > 0; --i) {
+            const auto byte = static_cast<unsigned char>(prefix[i - 1]);
+            if (byte == 0xFF) continue;
+            prefix[i - 1] = static_cast<char>(byte + 1);
+            prefix.resize(i);
+            return prefix;
+        }
+        return std::nullopt;
+    }
+
+    bool in_range(std::string_view key) const {
+        return key.size() >= prefix_.size() && key.substr(0, prefix_.size()) == prefix_;
+    }
+
+    void enqueue(size_t source_index) {
+        Source& source = sources_[source_index];
+        std::string_view key;
+        if (source.memory) {
+            if (!source.memory_valid) return;
+            key = source.memory_it->first;
+        } else {
+            if (!source.sstable_valid) return;
+            key = source.sstable->index_entry(source.sstable_position).key;
+        }
+        if (!in_range(key)) return;
+        heap_.push(Node{std::string(key), source_index, source.rank});
+    }
+
+    std::optional<Skiplist::SnapshotEntry> read_current(const Source& source) const {
+        if (source.memory) return source.memory_it->second;
+        return source.sstable->read_entry(source.sstable_position);
+    }
+
+    void advance(size_t source_index) {
+        Source& source = sources_[source_index];
+        if (source.memory) {
+            if (scan_forward_) {
+                ++source.memory_it;
+                source.memory_valid = source.memory_it != source.memory->end();
+            } else if (source.memory_it == source.memory->begin()) {
+                source.memory_valid = false;
+            } else {
+                --source.memory_it;
+            }
+        } else {
+            if (scan_forward_) {
+                ++source.sstable_position;
+                source.sstable_valid = source.sstable_position < source.sstable->entry_count();
+            } else if (source.sstable_position == 0) {
+                source.sstable_valid = false;
+            } else {
+                --source.sstable_position;
+            }
+        }
+        enqueue(source_index);
+    }
+
+    std::string prefix_;
+    bool scan_forward_ = true;
+    std::vector<Source> sources_;
+    std::priority_queue<Node, std::vector<Node>, NodeOrder> heap_;
+};
+
+unsigned size_tier(uint64_t bytes) {
+    constexpr uint64_t kBaseSize = 1024ULL * 1024ULL;
+    const uint64_t units = std::max<uint64_t>(1, (bytes + kBaseSize - 1) / kBaseSize);
+    return static_cast<unsigned>((std::bit_width(units) - 1) / 2); // powers of four
 }
 
 }  // namespace
@@ -85,7 +280,9 @@ LsmEngine::LsmEngine(const std::string& db_path, std::shared_ptr<core::Arena> ar
     std::filesystem::create_directories(db_path_);
     
     manifest_ = std::make_shared<Manifest>(db_path_);
-    manifest_->load();
+    if (!manifest_->load()) {
+        throw std::runtime_error("failed to load a complete, valid manifest from " + db_path_);
+    }
     
     compaction_manager_ = std::make_unique<CompactionManager>(db_path_, manifest_);
 
@@ -117,10 +314,32 @@ void LsmEngine::load_sstables_from_manifest() {
     std::sort(all.begin(), all.end(), [](const SSTableMetadata& a, const SSTableMetadata& b) {
         return a.sequence_number > b.sequence_number;
     });
+    std::set<std::string> referenced_paths;
     for (const auto& meta : all) {
-        if (std::filesystem::exists(meta.path)) {
-            sstables_.push_back(std::make_shared<SSTable>(meta.path));
+        const std::string normalized = std::filesystem::path(meta.path).lexically_normal().string();
+        referenced_paths.insert(normalized);
+        if (!std::filesystem::exists(meta.path)) {
+            throw std::runtime_error("manifest references missing SSTable: " + meta.path);
         }
+        sstables_.push_back(std::make_shared<SSTable>(meta.path));
+    }
+
+    // A crash can leave a completed output between atomic SST publication and manifest
+    // publication. Once every manifest reference has opened successfully, unreferenced
+    // .sst files are unreachable by definition and can be removed without touching data.
+    std::error_code iteration_error;
+    for (const auto& entry : std::filesystem::directory_iterator(db_path_, iteration_error)) {
+        if (!entry.is_regular_file() || entry.path().extension() != ".sst") continue;
+        const std::string normalized = entry.path().lexically_normal().string();
+        if (referenced_paths.contains(normalized)) continue;
+        std::error_code remove_error;
+        if (!std::filesystem::remove(entry.path(), remove_error) && remove_error) {
+            std::cerr << "Failed to remove orphan SSTable " << entry.path() << ": "
+                      << remove_error.message() << std::endl;
+        }
+    }
+    if (iteration_error) {
+        throw std::runtime_error("failed to inspect SSTable directory: " + iteration_error.message());
     }
 }
 
@@ -219,18 +438,7 @@ std::shared_ptr<WriteAheadLog> LsmEngine::put_locked(const std::string& ik, cons
     auto target_wal = wal_;  // the WAL this record is appended to
     append_to_wal(ik, false, attributes);
     memtable_->put(ik, attributes);
-    if (memtable_->size() >= memtable_flush_threshold_) {
-        // Freeze the memtable together with its WAL segment, then start a fresh
-        // memtable and WAL generation. sync() here makes the frozen segment (including
-        // the record just appended) durable before it is abandoned for a new WAL, so
-        // the caller's later commit(target_wal) is a cheap, already-synced no-op.
-        wal_->sync();
-        immutable_memtables_.push_back({std::move(memtable_), wal_path(wal_generation_)});
-        memtable_ = std::make_unique<MemTable>();
-        ++wal_generation_;
-        wal_ = std::make_shared<WriteAheadLog>(wal_path(wal_generation_));
-        flush_cv_.notify_one();
-    }
+    rotate_memtable_if_needed();
     return target_wal;
 }
 
@@ -238,7 +446,21 @@ std::shared_ptr<WriteAheadLog> LsmEngine::remove_locked(const std::string& ik) {
     auto target_wal = wal_;
     append_to_wal(ik, true, {});
     memtable_->remove(ik);
+    rotate_memtable_if_needed();
     return target_wal;
+}
+
+void LsmEngine::rotate_memtable_if_needed() {
+    if (memtable_->size() < memtable_flush_threshold_) return;
+    // Freeze the memtable together with its WAL segment, then start a fresh
+    // generation. Deletes must take this path too; otherwise a delete-heavy workload
+    // leaves an unbounded tombstone memtable that is never flushed.
+    wal_->sync();
+    immutable_memtables_.push_back({std::move(memtable_), wal_path(wal_generation_)});
+    memtable_ = std::make_unique<MemTable>();
+    ++wal_generation_;
+    wal_ = std::make_shared<WriteAheadLog>(wal_path(wal_generation_));
+    flush_cv_.notify_one();
 }
 
 std::optional<StorageEngine::AttributeMap> LsmEngine::get_locked(const std::string& ik) const {
@@ -316,83 +538,62 @@ LsmEngine::MutationOutcome LsmEngine::mutate(const std::string& table_name, cons
 }
 
 void LsmEngine::drop_table(const std::string& table_name) {
-    std::shared_ptr<WriteAheadLog> committed_wal;
-    {
-        std::unique_lock lock(mutex_);
-        // The LSM keeps all tables in one keyspace, so dropping a table means
-        // tombstoning every key under its prefix. Compaction later reclaims the space.
-        const std::string prefix = table_prefix(table_name);
-        auto live = materialize(prefix);
-        for (auto it = live.lower_bound(prefix); it != live.end(); ++it) {
-            if (it->first.compare(0, prefix.size(), prefix) != 0) break;
-            committed_wal = remove_locked(it->first);  // all removes share one WAL
-        }
-    }
-    if (committed_wal) committed_wal->commit();  // one group-commit for the whole drop
-}
-
-// Builds a merged, tombstone-resolved, sorted view by reading every level newest-first
-// and keeping the first decision seen for each key. When `prefix` is set the work is
-// bounded to that key range: memtable entries outside it are skipped, and — critically
-// — only in-range SSTable keys are DECODED (sstable->get is the expensive step). This
-// keeps a Scan/Query proportional to the queried table, not the whole store.
-std::map<std::string, StorageEngine::AttributeMap, core::StringViewLess> LsmEngine::materialize(std::string_view prefix) const {
-    std::map<std::string, AttributeMap, core::StringViewLess> live;
-    std::set<std::string> decided;
-
-    auto in_prefix = [&](const std::string& k) {
-        return prefix.empty() ||
-               (k.size() >= prefix.size() && k.compare(0, prefix.size(), prefix.data(), prefix.size()) == 0);
-    };
-
-    auto consider = [&](const std::map<std::string, Skiplist::SnapshotEntry, core::StringViewLess>& snapshot) {
-        for (const auto& [k, e] : snapshot) {
-            if (!in_prefix(k)) continue;              // outside the requested table
-            if (!decided.insert(k).second) continue;  // newer level already decided
-            if (!e.is_deleted) live.emplace(k, e.attributes);
-        }
-    };
-
-    consider(memtable_->get_all_entries());
-    for (auto it = immutable_memtables_.rbegin(); it != immutable_memtables_.rend(); ++it) {
-        consider(it->table->get_all_entries());
-    }
-    for (const auto& sstable : sstables_) {  // newest-first
-        const auto& idx = sstable->index();
-        // index() is key-sorted; jump to the prefix range so out-of-table keys are
-        // never decoded (they used to be — that was the O(store)-per-query blowup).
-        auto begin = prefix.empty()
-            ? idx.begin()
-            : std::lower_bound(idx.begin(), idx.end(), prefix,
-                  [](const SSTable::IndexEntry& e, std::string_view p) { return std::string_view(e.key) < p; });
-        for (auto e = begin; e != idx.end(); ++e) {
-            if (!in_prefix(e->key)) break;             // sorted: past the prefix range
-            if (!decided.insert(e->key).second) continue;
-            if (auto v = sstable->get(e->key)) {
-                live.emplace(e->key, *v);
+    const std::string prefix = table_prefix(table_name);
+    std::optional<std::string> cursor;
+    while (true) {
+        std::vector<std::string> keys;
+        {
+            std::shared_lock lock(mutex_);
+            std::vector<SnapshotMap> snapshots;
+            snapshots.push_back(memtable_->get_all_entries());
+            for (auto it = immutable_memtables_.rbegin(); it != immutable_memtables_.rend(); ++it) {
+                snapshots.push_back(it->table->get_all_entries());
             }
-            // else: tombstone; shadow older levels by leaving it out.
+            MergedReader reader(std::move(snapshots), sstables_, prefix, cursor);
+            while (keys.size() < memtable_flush_threshold_) {
+                auto row = reader.next();
+                if (!row) break;
+                keys.push_back(std::move(row->key));
+            }
         }
+        if (keys.empty()) break;
+        cursor = keys.back();
+
+        std::shared_ptr<WriteAheadLog> committed_wal;
+        {
+            std::unique_lock lock(mutex_);
+            for (const auto& key : keys) committed_wal = remove_locked(key);
+        }
+        if (committed_wal) committed_wal->commit();
     }
-    return live;
 }
 
 LsmEngine::ScanResult LsmEngine::scan(const std::string& table_name, const std::optional<std::string>& exclusive_start_key, size_t limit) {
     ScanResult result;
     std::shared_lock lock(mutex_);
     const std::string prefix = table_prefix(table_name);
-    auto live = materialize(prefix);
-
-    auto it = exclusive_start_key ? live.upper_bound(prefix + *exclusive_start_key)
-                                   : live.lower_bound(prefix);
-    for (; it != live.end(); ++it) {
-        if (it->first.compare(0, prefix.size(), prefix) != 0) break;  // left this table
-        if (limit != 0 && result.items.size() == limit) {
-            // Report the user-facing (table-stripped) key as the cursor.
-            result.last_evaluated_key = std::prev(it)->first.substr(prefix.size());
-            return result;
+    std::vector<SnapshotMap> snapshots;
+    snapshots.push_back(memtable_->get_all_entries());
+    for (auto it = immutable_memtables_.rbegin(); it != immutable_memtables_.rend(); ++it) {
+        snapshots.push_back(it->table->get_all_entries());
+    }
+    const std::optional<std::string> start = exclusive_start_key
+        ? std::optional<std::string>(prefix + *exclusive_start_key)
+        : std::nullopt;
+    MergedReader reader(std::move(snapshots), sstables_, prefix, start);
+    std::string last_user_key;
+    size_t page_bytes = 0;
+    while (auto row = reader.next()) {
+        const size_t item_bytes = item_size_bytes(row->attributes);
+        if (!result.items.empty() &&
+            ((limit != 0 && result.items.size() == limit) ||
+             item_bytes > kMaxReadPageBytes - std::min(page_bytes, kMaxReadPageBytes))) {
+            result.last_evaluated_key = last_user_key;
+            break;
         }
-        result.items.push_back(it->second);
+        last_user_key = row->key.substr(prefix.size());
+        page_bytes = core::size_saturating_add(page_bytes, item_bytes);
+        result.items.push_back(std::move(row->attributes));
     }
     return result;
 }
@@ -402,25 +603,35 @@ LsmEngine::QueryResult LsmEngine::query(
     const AttributeMap& key_conditions,
     const std::optional<std::string>& exclusive_start_key,
     size_t limit,
-    const std::optional<std::string>& key_prefix) {
+    const std::optional<std::string>& key_prefix,
+    bool scan_forward) {
     QueryResult result;
     std::shared_lock lock(mutex_);
     const std::string prefix = table_prefix(table_name);
     const std::string query_prefix = key_prefix ? prefix + *key_prefix : prefix;
-    auto live = materialize(query_prefix);
-
-    auto it = exclusive_start_key ? live.upper_bound(prefix + *exclusive_start_key)
-                                   : live.lower_bound(query_prefix);
+    std::vector<SnapshotMap> snapshots;
+    snapshots.push_back(memtable_->get_all_entries());
+    for (auto it = immutable_memtables_.rbegin(); it != immutable_memtables_.rend(); ++it) {
+        snapshots.push_back(it->table->get_all_entries());
+    }
+    const std::optional<std::string> start = exclusive_start_key
+        ? std::optional<std::string>(prefix + *exclusive_start_key)
+        : std::nullopt;
+    MergedReader reader(std::move(snapshots), sstables_, query_prefix, start, scan_forward);
     std::string last_user_key;
-    for (; it != live.end(); ++it) {
-        if (it->first.compare(0, query_prefix.size(), query_prefix) != 0) break;  // left this query range
-        if (!item_matches(it->second, key_conditions)) continue;
-        if (limit != 0 && result.items.size() == limit) {
+    size_t page_bytes = 0;
+    while (auto row = reader.next()) {
+        if (!item_matches(row->attributes, key_conditions)) continue;
+        const size_t item_bytes = item_size_bytes(row->attributes);
+        if (!result.items.empty() &&
+            ((limit != 0 && result.items.size() == limit) ||
+             item_bytes > kMaxReadPageBytes - std::min(page_bytes, kMaxReadPageBytes))) {
             result.last_evaluated_key = last_user_key;
-            return result;
+            break;
         }
-        result.items.push_back(it->second);
-        last_user_key = it->first.substr(prefix.size());
+        result.items.push_back(std::move(row->attributes));
+        page_bytes = core::size_saturating_add(page_bytes, item_bytes);
+        last_user_key = row->key.substr(prefix.size());
     }
     return result;
 }
@@ -448,7 +659,13 @@ void LsmEngine::flush_memtable() {
 
         std::string sst_path = db_path_ + "/table_" + std::to_string(seq) + ".sst";
         auto entries = to_flush->get_all_entries();
-        SSTable::create(sst_path, entries);  // slow file I/O, done without the lock
+        if (SSTable::create(sst_path, entries).empty()) {
+            std::cerr << "Flush failed while writing " << sst_path << "; retaining WAL for retry"
+                      << std::endl;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+        auto flushed_sstable = std::make_shared<SSTable>(sst_path);
 
         SSTableMetadata meta;
         meta.path = sst_path;
@@ -464,10 +681,17 @@ void LsmEngine::flush_memtable() {
             // the lock, so flush and compaction never interleave their manifest edits.
             std::unique_lock lock(mutex_);
             manifest_->add_file(0, meta);
-            manifest_->save();
-            sstables_.push_front(std::make_shared<SSTable>(sst_path));
+            if (!manifest_->save()) {
+                manifest_->remove_file(0, sst_path);
+                std::error_code remove_error;
+                std::filesystem::remove(sst_path, remove_error);
+                std::cerr << "Flush failed while publishing manifest; retaining WAL for retry"
+                          << std::endl;
+                continue;
+            }
+            sstables_.push_front(std::move(flushed_sstable));
             immutable_memtables_.erase(immutable_memtables_.begin());
-            if (auto_compaction_enabled() && compaction_manager_->should_compact_L0()) {
+            if (auto_compaction_enabled() && sstables_.size() >= 4) {
                 compaction_pending_ = true;
                 compaction_cv_.notify_one();
             }
@@ -495,87 +719,172 @@ void LsmEngine::background_compaction() {
         // and to publish. The heavy merge + SSTable write runs unlocked so readers and
         // writers are not frozen for the duration (the old path held mutex_ across the
         // whole merge + disk write, stalling everything at scale).
-        compact();
+        try {
+            bool compacted = false;
+            while (!shutting_down_ && compact()) compacted = true;
+            if (compacted) trim_free_heap_after_compaction();
+        } catch (const std::exception& error) {
+            std::cerr << "Compaction failed: " << error.what() << std::endl;
+        }
     }
 }
 
-void LsmEngine::compact() {
-    // --- Phase 1: snapshot the SSTable set + manifest refs under the lock. ---
+bool LsmEngine::compact() {
+    // Select four similarly-sized files. Size-tiered batches prevent repeatedly
+    // rewriting a multi-gigabyte bottom table whenever a few 1 MB memtables flush.
+    constexpr size_t kCompactionFanout = 4;
     std::deque<std::shared_ptr<SSTable>> to_merge;
     std::map<std::string, std::pair<uint32_t, uint64_t>> manifest_files;
+    std::map<std::string, SSTableMetadata> manifest_metadata;
+    uint64_t physical_sequence = 0;
+    bool complete_snapshot = false;
     {
         std::unique_lock lock(mutex_);
-        if (sstables_.size() < 2) return;  // nothing to gain from merging one file
-        to_merge = sstables_;              // copy of shared_ptrs (newest-first)
+        if (sstables_.size() < kCompactionFanout) return false;
         for (uint32_t level = 0; level < 16; ++level) {
             for (const auto& m : manifest_->get_level_files(level)) {
                 manifest_files[m.path] = {level, m.sequence_number};
+                manifest_metadata[m.path] = m;
             }
         }
+
+        // Only merge a contiguous sequence run. Combining non-adjacent files and
+        // assigning the output their highest sequence would incorrectly promote an
+        // old value above an unselected newer file that sat between the inputs.
+        std::vector<std::shared_ptr<SSTable>> run;
+        std::optional<unsigned> run_tier;
+        for (auto it = sstables_.rbegin(); it != sstables_.rend(); ++it) {
+            const unsigned tier = size_tier((*it)->file_size());
+            if (!run_tier || *run_tier != tier) {
+                run.clear();
+                run_tier = tier;
+            }
+            run.push_back(*it); // oldest to newest
+            if (run.size() == kCompactionFanout) {
+                for (auto candidate = run.rbegin(); candidate != run.rend(); ++candidate) {
+                    to_merge.push_back(*candidate); // newest to oldest
+                }
+                break;
+            }
+        }
+        if (to_merge.empty()) return false;
+        complete_snapshot = to_merge.size() == sstables_.size();
+        physical_sequence = manifest_->get_next_sequence();
+        manifest_->set_next_sequence(physical_sequence + 1);
     }
 
-    // --- Phase 2: merge + write the result, UNLOCKED (the expensive part). ---
-    // Merge newest-first: the first version seen of a key wins, and a tombstone (key
-    // in the index but get() returns nothing) drops the key entirely. Safe because we
-    // merge the complete snapshot, so no older version of a dropped key survives below.
-    std::map<std::string, Skiplist::SnapshotEntry, core::StringViewLess> merged;
-    std::set<std::string> seen;
-    uint64_t merged_seq = 0;
+    uint64_t logical_sequence = 0;
     std::vector<std::string> old_paths;
-    for (const auto& sstable : to_merge) {  // newest-first
+    old_paths.reserve(to_merge.size());
+    for (const auto& sstable : to_merge) {
         old_paths.push_back(sstable->path());
-        auto mit = manifest_files.find(sstable->path());
-        if (mit != manifest_files.end()) merged_seq = std::max(merged_seq, mit->second.second);
-        for (const auto& idx : sstable->index()) {
-            if (!seen.insert(idx.key).second) continue;
-            if (auto v = sstable->get(idx.key)) {
-                merged.emplace(idx.key, Skiplist::SnapshotEntry{*v, false});
-            }
+        logical_sequence = std::max(logical_sequence, manifest_files.at(sstable->path()).second);
+    }
+
+    const std::string merged_path =
+        db_path_ + "/table_" + std::to_string(physical_sequence) + "_c.sst";
+    SSTableWriter writer(merged_path);
+
+    struct Cursor {
+        std::string_view key;
+        size_t source = 0;
+        size_t position = 0;
+    };
+    struct CursorOrder {
+        bool operator()(const Cursor& left, const Cursor& right) const {
+            if (left.key != right.key) return left.key > right.key;
+            return left.source > right.source;
+        }
+    };
+    std::priority_queue<Cursor, std::vector<Cursor>, CursorOrder> heap;
+    for (size_t source = 0; source < to_merge.size(); ++source) {
+        if (to_merge[source]->entry_count() > 0) {
+            heap.push(Cursor{to_merge[source]->index_entry(0).key, source, 0});
         }
     }
 
-    // The merged file inherits the highest sequence number it replaces, so any SSTable
-    // flushed after this compaction still sorts as newer on restart.
-    const std::string merged_path =
-        db_path_ + "/table_" + std::to_string(merged_seq) + "_c.sst";
-    SSTable::create(merged_path, merged);  // slow file I/O, done without the lock
+    while (!heap.empty()) {
+        const std::string key(heap.top().key);
+        std::vector<Cursor> same_key;
+        do {
+            same_key.push_back(heap.top());
+            heap.pop();
+        } while (!heap.empty() && heap.top().key == key);
 
-    // --- Phase 3: publish under the lock, preserving concurrently-flushed SSTables. ---
+        const auto winner = std::min_element(same_key.begin(), same_key.end(),
+            [](const Cursor& left, const Cursor& right) { return left.source < right.source; });
+        auto entry = to_merge[winner->source]->read_entry(winner->position);
+        if (!entry) throw std::runtime_error("corrupt SSTable record during compaction");
+        if (!entry->is_deleted || !complete_snapshot) {
+            if (!writer.append(key, *entry)) {
+                throw std::runtime_error("failed to stream compacted SSTable entry");
+            }
+        }
+
+        for (const Cursor& cursor : same_key) {
+            const size_t next = cursor.position + 1;
+            if (next < to_merge[cursor.source]->entry_count()) {
+                heap.push(Cursor{to_merge[cursor.source]->index_entry(next).key,
+                                 cursor.source, next});
+            }
+        }
+    }
+    if (!writer.finish()) throw std::runtime_error("failed to finalize compacted SSTable");
+    auto merged_sstable = std::make_shared<SSTable>(merged_path);
+
     {
         std::unique_lock lock(mutex_);
-        // Drop only the files we actually merged; flush only ever ADDS files, so any
-        // entry not in our snapshot was flushed during the merge and must survive.
-        for (const auto& [path, ref] : manifest_files) {
+        for (const auto& path : old_paths) {
+            const auto& ref = manifest_files.at(path);
             manifest_->remove_file(ref.first, path);
         }
         SSTableMetadata meta;
         meta.path = merged_path;
         meta.level = 1;
-        meta.sequence_number = merged_seq;
-        if (!merged.empty()) {
-            meta.min_key = merged.begin()->first;
-            meta.max_key = merged.rbegin()->first;
-        }
+        meta.sequence_number = logical_sequence;
+        meta.min_key = writer.min_key();
+        meta.max_key = writer.max_key();
+        meta.file_size = std::filesystem::file_size(merged_path);
+        meta.entry_count = writer.entry_count();
         manifest_->add_file(1, meta);
-        manifest_->save();
+        if (!manifest_->save()) {
+            manifest_->remove_file(1, merged_path);
+            for (const auto& path : old_paths) {
+                const auto& original = manifest_metadata.at(path);
+                manifest_->add_file(original.level, original);
+            }
+            (void)manifest_->save();
+            std::error_code remove_error;
+            std::filesystem::remove(merged_path, remove_error);
+            throw std::runtime_error("failed to atomically publish compaction manifest");
+        }
 
-        // Rebuild the in-memory list: keep SSTables flushed during the unlocked merge
-        // (newer than merged_seq, so they stay at the front, newest-first), then append
-        // the merged result as the oldest level.
         const std::set<std::string> merged_set(old_paths.begin(), old_paths.end());
         std::deque<std::shared_ptr<SSTable>> kept;
-        for (const auto& s : sstables_) {
-            if (!merged_set.count(s->path())) kept.push_back(s);
+        bool inserted = false;
+        for (const auto& current : sstables_) {
+            if (merged_set.count(current->path())) {
+                if (!inserted) {
+                    kept.push_back(merged_sstable);
+                    inserted = true;
+                }
+                continue;
+            }
+            kept.push_back(current);
         }
-        kept.push_back(std::make_shared<SSTable>(merged_path));
+        if (!inserted) kept.push_back(std::move(merged_sstable));
         sstables_ = std::move(kept);
     }
 
     // Delete the now-obsolete files from disk (outside the lock).
     for (const auto& p : old_paths) {
         std::error_code ec;
-        std::filesystem::remove(p, ec);
+        if (!std::filesystem::remove(p, ec) && ec) {
+            std::cerr << "Failed to remove compacted SSTable " << p << ": "
+                      << ec.message() << std::endl;
+        }
     }
+    return true;
 }
 
 std::string LsmEngine::get_table_path(const std::string& table_name) const {

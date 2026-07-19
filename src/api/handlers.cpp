@@ -22,9 +22,6 @@
 #include <string>
 #include <string_view>
 #include <vector>
-#ifdef __GLIBC__
-#include <malloc.h>
-#endif
 
 namespace cynamodb::api {
 
@@ -39,17 +36,12 @@ ApiResult ok(std::string body) {
     return ApiResult{200, "", std::move(body)};
 }
 
-void trim_heap_after_bulk_read() {
-#ifdef __GLIBC__
-    const char* disabled = std::getenv("CYNAMODB_DISABLE_MALLOC_TRIM");
-    if (disabled) {
-        const std::string_view flag(disabled);
-        if (flag == "1" || flag == "true" || flag == "on") {
-            return;
-        }
-    }
-    malloc_trim(0);
-#endif
+// Storage enforces DynamoDB's 1 MiB data page. Keep an item-count ceiling as a second
+// guard so tiny-item scans cannot retain arbitrarily large vectors per request.
+constexpr size_t kMaxReadPageItems = 1000;
+
+size_t bounded_read_limit(size_t requested) {
+    return requested == 0 ? kMaxReadPageItems : std::min(requested, kMaxReadPageItems);
 }
 
 ApiResult error(unsigned status, const std::string& type, const std::string& message) {
@@ -1208,23 +1200,17 @@ ApiResult handle_scan(engine::TableManager& tables, engine::StorageEngine& stora
     size_t matched_count = 0;
     size_t scanned = 0;
     std::optional<std::string> last_evaluated;
-    std::optional<std::string> last_scanned;  // key of the most recently scanned segment item
 
     // Segmented and non-segmented share one evaluation loop. For a segmented scan the
     // whole namespace is fetched and only the segment's keys are evaluated (pagination
     // is applied in-handler); otherwise the storage layer applies the limit/cursor.
-    auto page = storage.scan(scan_table, start, segmented ? 0 : limit);
+    auto page = storage.scan(scan_table, start, bounded_read_limit(limit));
     for (const auto& item : page.items) {
         if (segmented && (fnv1a(storage_key(item)) % static_cast<uint64_t>(total_segments)) !=
                              static_cast<uint64_t>(segment)) {
             continue;  // not this segment
         }
-        if (segmented && limit != 0 && scanned == limit) {
-            last_evaluated = last_scanned;  // resume after the last item we actually scanned
-            break;
-        }
         ++scanned;
-        last_scanned = lek_json(item);
         if (!idx && item_is_expired(*def, item)) continue;  // TTL applies to base-table scans
         if (has_filter) {
             int r = evaluate_boolean_expr(filter, item, names, *values_opt);
@@ -1246,6 +1232,11 @@ ApiResult handle_scan(engine::TableManager& tables, engine::StorageEngine& stora
     if (!segmented) {
         scanned = page.items.size();
         if (page.last_evaluated_key && !page.items.empty()) last_evaluated = lek_json(page.items.back());
+    } else if (page.last_evaluated_key && !page.items.empty()) {
+        // The cursor follows the underlying storage range, including records assigned
+        // to other segments, so sparse segments make forward progress without loading
+        // the entire table into one response.
+        last_evaluated = lek_json(page.items.back());
     }
 
     std::string out = "{";
@@ -1254,9 +1245,6 @@ ApiResult handle_scan(engine::TableManager& tables, engine::StorageEngine& stora
            ",\"ScannedCount\":" + std::to_string(scanned);
     if (last_evaluated) out += ",\"LastEvaluatedKey\":" + *last_evaluated;
     out += "}";
-    output.clear();
-    output.shrink_to_fit();
-    trim_heap_after_bulk_read();
     return ok(std::move(out));
 }
 
@@ -1317,16 +1305,19 @@ ApiResult handle_index_query(engine::StorageEngine& storage,
     const bool count_only = select_count == 1;
 
     std::optional<std::string> storage_start;
-    if (forward && !parsed.sort.present) {
-        simdjson::dom::element esk_el;
-        if (doc["ExclusiveStartKey"].get(esk_el) == simdjson::SUCCESS) {
-            if (auto esk_map = parse_attribute_map(esk_el)) {
-                storage_start = encode_index_storage_key(*idx, def, *esk_map);
-            }
+    simdjson::dom::element storage_esk_el;
+    if (doc["ExclusiveStartKey"].get(storage_esk_el) == simdjson::SUCCESS) {
+        if (auto esk_map = parse_attribute_map(storage_esk_el)) {
+            storage_start = encode_index_storage_key(*idx, def, *esk_map);
         }
     }
-    const size_t storage_limit = (forward && !parsed.sort.present) ? limit : 0;
-    auto result = storage.query(storage_tbl, pk_condition, storage_start, storage_limit, encode_key_prefix(parsed.pk_value));
+    const size_t storage_limit = bounded_read_limit(limit);
+    auto result = storage.query(storage_tbl, pk_condition, storage_start, storage_limit,
+                                encode_key_prefix(parsed.pk_value), forward);
+    std::optional<std::string> storage_cursor_json;
+    if (result.last_evaluated_key && !result.items.empty()) {
+        storage_cursor_json = index_key_only_json(*idx, def, result.items.back());
+    }
 
     std::vector<AttributeMap> matched;
     for (auto& item : result.items) {
@@ -1336,7 +1327,6 @@ ApiResult handle_index_query(engine::StorageEngine& storage,
         }
         matched.push_back(std::move(item));
     }
-    if (!forward) std::reverse(matched.begin(), matched.end());
 
     // ExclusiveStartKey carries the index + base key attributes. When the storage
     // layer can apply it safely, begin_idx stays at zero and no full partition walk
@@ -1381,8 +1371,8 @@ ApiResult handle_index_query(engine::StorageEngine& storage,
             output.push_back(item);
         }
     }
-    if (!last_evaluated && result.last_evaluated_key && !matched.empty()) {
-        last_evaluated = index_key_only_json(*idx, def, matched.back());
+    if (!last_evaluated && storage_cursor_json) {
+        last_evaluated = std::move(storage_cursor_json);
     }
 
     std::string out = "{";
@@ -1391,13 +1381,6 @@ ApiResult handle_index_query(engine::StorageEngine& storage,
            ",\"ScannedCount\":" + std::to_string(examined);
     if (last_evaluated) out += ",\"LastEvaluatedKey\":" + *last_evaluated;
     out += "}";
-    output.clear();
-    output.shrink_to_fit();
-    matched.clear();
-    matched.shrink_to_fit();
-    result.items.clear();
-    result.items.shrink_to_fit();
-    trim_heap_after_bulk_read();
     return ok(std::move(out));
 }
 
@@ -1475,8 +1458,8 @@ ApiResult handle_query(engine::TableManager& tables, engine::StorageEngine& stor
     bool forward = true;
     auto sif_rc = doc["ScanIndexForward"].get_bool().get(forward); (void)sif_rc;
 
-    // Fetch the whole partition (ascending), then apply sort condition, ordering,
-    // pagination, filter, projection and limit at the handler level.
+    // Stream one bounded partition page in the requested direction, then apply sort
+    // conditions, filtering, and projection at the handler level.
     std::optional<std::string> storage_prefix;
     if (doc["KeyConditionExpression"].get_string().get(kce_view) == simdjson::SUCCESS) {
         auto parsed = parse_key_condition(std::string(kce_view), names, *values_opt);
@@ -1494,9 +1477,14 @@ ApiResult handle_query(engine::TableManager& tables, engine::StorageEngine& stor
     const bool count_only = select_count == 1;
 
     std::optional<std::string> storage_start;
-    if (forward && !sort.present) storage_start = read_start_key(doc, *def);
-    const size_t storage_limit = (forward && !sort.present) ? limit : 0;
-    auto result = storage.query(std::string(name), pk_condition, storage_start, storage_limit, storage_prefix);
+    storage_start = read_start_key(doc, *def);
+    const size_t storage_limit = bounded_read_limit(limit);
+    auto result = storage.query(std::string(name), pk_condition, storage_start, storage_limit,
+                                storage_prefix, forward);
+    std::optional<std::string> storage_cursor_json;
+    if (result.last_evaluated_key && !result.items.empty()) {
+        storage_cursor_json = key_only_json(*def, result.items.back());
+    }
     std::vector<AttributeMap> matched;
     for (auto& item : result.items) {
         if (item_is_expired(*def, item)) continue;  // TTL: expired items are not returned
@@ -1506,7 +1494,6 @@ ApiResult handle_query(engine::TableManager& tables, engine::StorageEngine& stor
         }
         matched.push_back(std::move(item));
     }
-    if (!forward) std::reverse(matched.begin(), matched.end());
 
     // ExclusiveStartKey: skip everything up to and including the supplied key.
     auto esk = storage_start ? std::nullopt : read_start_key(doc, *def);
@@ -1547,8 +1534,8 @@ ApiResult handle_query(engine::TableManager& tables, engine::StorageEngine& stor
             output.push_back(item);
         }
     }
-    if (!last_evaluated && result.last_evaluated_key && !matched.empty()) {
-        last_evaluated = key_only_json(*def, matched.back());
+    if (!last_evaluated && storage_cursor_json) {
+        last_evaluated = std::move(storage_cursor_json);
     }
 
     std::string out = "{";
@@ -1559,13 +1546,6 @@ ApiResult handle_query(engine::TableManager& tables, engine::StorageEngine& stor
         out += ",\"LastEvaluatedKey\":" + *last_evaluated;
     }
     out += "}";
-    output.clear();
-    output.shrink_to_fit();
-    matched.clear();
-    matched.shrink_to_fit();
-    result.items.clear();
-    result.items.shrink_to_fit();
-    trim_heap_after_bulk_read();
     return ok(std::move(out));
 }
 

@@ -4,6 +4,60 @@ All notable changes to cynamoDB are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/) and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [2.5.4] - 2026-07-19
+
+Bounded-memory LSM reads and maintenance. On the 13.8 GiB production store with
+15,483,203 indexed records across 8,805 manifest SSTables, startup anonymous RSS fell
+from approximately 28.17 GiB to 129.5 MiB (99.55%). Under resumed ingestion and active
+backlog compaction it peaked at approximately 296 MiB; mapped SST pages are file-backed and
+reclaimable rather than heap-owned.
+
+### Fixed
+- **Every SST key was permanently duplicated on the heap.** SSTables now use read-only
+  `mmap` storage and retain only one 64-bit record offset per index entry. Record keys
+  and payloads are decoded directly from validated mapped ranges, and startup index
+  pages are advised away after offsets are built. Corrupt/truncated footer, index, and
+  record bounds now fail closed. (`sstable.cpp`, `sstable.hpp`)
+- **Query and Scan materialized the entire matching store before applying Limit.** A
+  forward/reverse K-way merge now streams active and immutable memtables plus SSTables,
+  applies table/partition/prefix/cursor bounds at the sources, suppresses stale values
+  and tombstones incrementally, and stops at the requested page. Storage pages are
+  bounded to 1 MiB of item data and API reads are additionally capped at 1,000 items
+  when callers omit or overstate `Limit`, with a resumable cursor.
+  (`lsm_engine.cpp`, `memory_engine.cpp`, `handlers.cpp`)
+- **Compaction held full-database key sets, value maps, and decoded items in memory.**
+  Compaction now merges a contiguous four-file size tier as a stream into an SST writer
+  whose index is spooled to disk. Contiguous sequence selection preserves overwrite
+  precedence; tombstones are retained until a full-store merge can safely discard
+  them. Deletes now rotate and flush memtables under the same bound as puts.
+- **Large HTTP buffers were trimmed while still live.** Allocator trimming now occurs
+  only after request and response ownership is released, avoiding a misleading no-op
+  mitigation while bounding retained transient arenas.
+- SST and manifest publication now use validated candidate files, `fdatasync`, atomic
+  rename, and directory sync; failed publication restores the prior in-memory manifest.
+- Manifest parsing validates file size, counts, levels, lengths, and complete input
+  before publishing parsed state. Missing referenced SSTables now stop startup, while
+  unreferenced crash outputs are removed only after every manifest file opens correctly.
+
+### Changed
+- Automatic size-tiered compaction is enabled by default. Set
+  `CYNAMODB_ENABLE_AUTO_COMPACTION=0` to disable it explicitly.
+- Docker contexts exclude all `build-*` trees so local sanitizer/release output cannot
+  inflate production builds.
+
+### Tests
+- Added an RSS regression executable with hard non-zero sampling checks. A 500,000-key
+  mapped index measured 3,912 KiB anonymous RSS growth; a 40,000-record, 1 KiB payload
+  workload with 10,000 overwrites, 8,000 deletes, compaction, and a fully paginated scan
+  peaked at 5,656 KiB in Release. The test requires a real compacted output and uses a
+  32 MiB failure ceiling; it also exposed and rejected a zero-reading
+  `/proc` parser instead of accepting a false green.
+- Added pagination coverage for omitted Scan limits and 1 MiB data pages, compaction
+  precedence with a newer SST between equal-size candidates, bounded corrupt-manifest
+  rejection, and manifest-safe orphan cleanup.
+- Full Debug unit/integration suite passed (6/6), plus ASan+UBSan with leak detection
+  (5/5 excluding the RSS test) and the independent Release memory workload.
+
 ## [2.5.3] - 2026-07-07
 
 ### Fixed

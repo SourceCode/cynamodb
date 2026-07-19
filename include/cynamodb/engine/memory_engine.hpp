@@ -32,7 +32,8 @@ public:
         const AttributeMap& key_conditions,
         const std::optional<std::string>& exclusive_start_key,
         size_t limit,
-        const std::optional<std::string>& key_prefix = std::nullopt) override;
+        const std::optional<std::string>& key_prefix = std::nullopt,
+        bool scan_forward = true) override;
 
     // Legacy methods
     std::expected<void, StorageError> put_item(const core::TableDefinition& table_def, const Item& item);

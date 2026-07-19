@@ -45,6 +45,17 @@ bool item_matches_conditions(const StorageEngine::AttributeMap& item,
     return true;
 }
 
+std::optional<std::string> prefix_successor(std::string prefix) {
+    for (size_t i = prefix.size(); i > 0; --i) {
+        const auto byte = static_cast<unsigned char>(prefix[i - 1]);
+        if (byte == 0xFF) continue;
+        prefix[i - 1] = static_cast<char>(byte + 1);
+        prefix.resize(i);
+        return prefix;
+    }
+    return std::nullopt;
+}
+
 }  // namespace
 
 void MemoryEngine::put(const std::string& table_name, const std::string& key, const AttributeMap& attributes) {
@@ -116,13 +127,20 @@ MemoryEngine::ScanResult MemoryEngine::scan(const std::string& table_name, const
         it = items.upper_bound(*exclusive_start_key);
     }
 
+    size_t page_bytes = 0;
+    std::string last_key;
     for (; it != items.end(); ++it) {
-        if (limit != 0 && result.items.size() == limit) {
+        const size_t item_bytes = item_size_bytes(it->second);
+        if (!result.items.empty() &&
+            ((limit != 0 && result.items.size() == limit) ||
+             item_bytes > kMaxReadPageBytes - std::min(page_bytes, kMaxReadPageBytes))) {
             // More items remain: report a pagination token so the caller can resume.
-            result.last_evaluated_key = std::prev(it)->first;
+            result.last_evaluated_key = last_key;
             return result;
         }
         result.items.push_back(it->second);
+        page_bytes = core::size_saturating_add(page_bytes, item_bytes);
+        last_key = it->first;
     }
     return result;
 }
@@ -132,7 +150,8 @@ MemoryEngine::QueryResult MemoryEngine::query(
     const AttributeMap& key_conditions,
     const std::optional<std::string>& exclusive_start_key,
     size_t limit,
-    const std::optional<std::string>& key_prefix) {
+    const std::optional<std::string>& key_prefix,
+    bool scan_forward) {
     QueryResult result;
     std::shared_lock lock(mutex_);
     auto table_it = data_.find(table_name);
@@ -141,26 +160,45 @@ MemoryEngine::QueryResult MemoryEngine::query(
     }
     const auto& items = table_it->second;
 
-    auto it = key_prefix ? items.lower_bound(*key_prefix) : items.begin();
-    if (exclusive_start_key) {
-        it = items.upper_bound(*exclusive_start_key);
+    std::string last_key;
+    size_t page_bytes = 0;
+    if (scan_forward) {
+        auto it = key_prefix ? items.lower_bound(*key_prefix) : items.begin();
+        if (exclusive_start_key) it = items.upper_bound(*exclusive_start_key);
+        for (; it != items.end(); ++it) {
+            if (key_prefix && it->first.compare(0, key_prefix->size(), *key_prefix) != 0) break;
+            if (!item_matches_conditions(it->second, key_conditions)) continue;
+            const size_t item_bytes = item_size_bytes(it->second);
+            if (!result.items.empty() &&
+                ((limit != 0 && result.items.size() == limit) ||
+                 item_bytes > kMaxReadPageBytes - std::min(page_bytes, kMaxReadPageBytes))) {
+                result.last_evaluated_key = last_key;
+                break;
+            }
+            result.items.push_back(it->second);
+            page_bytes = core::size_saturating_add(page_bytes, item_bytes);
+            last_key = it->first;
+        }
+        return result;
     }
 
-    std::string last_key;
-    for (; it != items.end(); ++it) {
-        if (key_prefix && it->first.compare(0, key_prefix->size(), *key_prefix) != 0) {
+    auto it = exclusive_start_key ? items.lower_bound(*exclusive_start_key) : items.end();
+    if (!exclusive_start_key && key_prefix) {
+        if (auto upper = prefix_successor(*key_prefix)) it = items.lower_bound(*upper);
+    }
+    while (it != items.begin()) {
+        --it;
+        if (key_prefix && it->first.compare(0, key_prefix->size(), *key_prefix) != 0) break;
+        if (!item_matches_conditions(it->second, key_conditions)) continue;
+        const size_t item_bytes = item_size_bytes(it->second);
+        if (!result.items.empty() &&
+            ((limit != 0 && result.items.size() == limit) ||
+             item_bytes > kMaxReadPageBytes - std::min(page_bytes, kMaxReadPageBytes))) {
+            result.last_evaluated_key = last_key;
             break;
         }
-        if (!item_matches_conditions(it->second, key_conditions)) {
-            continue;
-        }
-        if (limit != 0 && result.items.size() == limit) {
-            // Another match exists beyond the page: the cursor is the last item
-            // we actually returned, and resumption uses an exclusive upper_bound.
-            result.last_evaluated_key = last_key;
-            return result;
-        }
         result.items.push_back(it->second);
+        page_bytes = core::size_saturating_add(page_bytes, item_bytes);
         last_key = it->first;
     }
     return result;

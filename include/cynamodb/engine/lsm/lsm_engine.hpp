@@ -33,7 +33,8 @@ public:
         const AttributeMap& key_conditions,
         const std::optional<std::string>& exclusive_start_key,
         size_t limit,
-        const std::optional<std::string>& key_prefix = std::nullopt) override;
+        const std::optional<std::string>& key_prefix = std::nullopt,
+        bool scan_forward = true) override;
 
 private:
     // Lock-free building blocks; the caller must already hold mutex_ exclusively.
@@ -45,6 +46,7 @@ private:
     // commits that WAL *after releasing mutex_*, so the fsync no longer blocks readers.
     std::shared_ptr<WriteAheadLog> put_locked(const std::string& internal_key, const AttributeMap& attributes);
     std::shared_ptr<WriteAheadLog> remove_locked(const std::string& internal_key);
+    void rotate_memtable_if_needed();
 
     void flush_memtable();
     void background_compaction();
@@ -53,14 +55,8 @@ private:
     // phases: it snapshots the SSTable set under the lock, performs the merge + file
     // write UNLOCKED (like flush_memtable), then re-locks only to swap the manifest,
     // preserving any SSTables flushed concurrently. Must NOT be called with mutex_ held.
-    void compact();
+    bool compact();
     std::string get_table_path(const std::string& table_name) const;
-    // Merged, tombstone-resolved, sorted snapshot across all levels. Caller must hold
-    // mutex_ (shared is sufficient). When `prefix` is non-empty the result is bounded
-    // to that key range (one table), so a Scan/Query decodes only that table's records
-    // instead of the entire store — the difference between O(table) and O(store) per
-    // query, which is what let concurrent queries pin every core once the store grew.
-    std::map<std::string, AttributeMap, core::StringViewLess> materialize(std::string_view prefix = {}) const;
 
     // --- durability / recovery ---
     std::string wal_path(uint64_t generation) const;

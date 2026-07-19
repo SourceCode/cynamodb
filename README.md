@@ -1,4 +1,4 @@
-# cynamoDB v2.5.0
+# cynamoDB v2.5.4
 
 cynamoDB is a high-performance, local DynamoDB-compatible database engine written in C++23. It provides 1:1 API compatibility with Amazon DynamoDB, enabling local development, testing, and edge computing without relying on the AWS cloud.
 

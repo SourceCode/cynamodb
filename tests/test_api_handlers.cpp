@@ -8,6 +8,8 @@
 #include <atomic>
 #include <filesystem>
 #include <memory>
+#include <iomanip>
+#include <sstream>
 #include <string>
 
 using namespace cynamodb;
@@ -177,6 +179,32 @@ TEST_CASE("Scan returns items with count and pagination", "[api][handlers][scan]
         REQUIRE_THAT(page2.body, ContainsSubstring("\"u2\""));
         REQUIRE_THAT(page2.body, ContainsSubstring("\"u3\""));
     }
+}
+
+TEST_CASE("Scan without Limit is bounded and resumable", "[api][handlers][scan][memory]") {
+    Harness h;
+    h.create_simple_table("Users");
+
+    for (int i = 0; i < 1005; ++i) {
+        std::ostringstream key;
+        key << 'u' << std::setw(4) << std::setfill('0') << i;
+        auto r = h.call(api::Operation::PutItem,
+                        R"({"TableName":"Users","Item":{"pk":{"S":")" + key.str() + R"("}}})");
+        REQUIRE(r.status == 200);
+    }
+
+    auto first = h.call(api::Operation::Scan, R"({"TableName":"Users"})");
+    REQUIRE(first.status == 200);
+    REQUIRE_THAT(first.body, ContainsSubstring("\"Count\":1000"));
+    REQUIRE_THAT(first.body, ContainsSubstring("\"LastEvaluatedKey\":{"));
+    REQUIRE_THAT(first.body, ContainsSubstring("\"pk\":{\"S\":\"u0999\"}"));
+
+    auto second = h.call(
+        api::Operation::Scan,
+        R"({"TableName":"Users","ExclusiveStartKey":{"pk":{"S":"u0999"}}})");
+    REQUIRE(second.status == 200);
+    REQUIRE_THAT(second.body, ContainsSubstring("\"Count\":5"));
+    REQUIRE(second.body.find("\"LastEvaluatedKey\"") == std::string::npos);
 }
 
 TEST_CASE("Query by partition key with a sort key", "[api][handlers][query]") {

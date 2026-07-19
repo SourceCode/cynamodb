@@ -6,6 +6,7 @@
 #include <memory>
 #include <optional>
 #include <vector>
+#include <cynamodb/core/sizing.hpp>
 #include <cynamodb/core/types.hpp>
 
 namespace cynamodb::engine {
@@ -14,6 +15,16 @@ class StorageEngine {
 public:
     using AttributeMap = std::map<std::string, std::shared_ptr<core::AttributeValue>, core::StringViewLess>;
     using Item = AttributeMap;
+    static constexpr size_t kMaxReadPageBytes = 1024U * 1024U;
+
+    static size_t item_size_bytes(const AttributeMap& item) {
+        size_t size = 0;
+        for (const auto& [name, value] : item) {
+            size = core::size_saturating_add(size, name.size());
+            if (value) size = core::size_saturating_add(size, core::attribute_size(*value));
+        }
+        return size;
+    }
 
     struct ScanResult {
         std::vector<AttributeMap> items;
@@ -62,7 +73,8 @@ public:
         const AttributeMap& key_conditions,
         const std::optional<std::string>& exclusive_start_key,
         size_t limit,
-        const std::optional<std::string>& key_prefix = std::nullopt) = 0;
+        const std::optional<std::string>& key_prefix = std::nullopt,
+        bool scan_forward = true) = 0;
 };
 
 } // namespace cynamodb::engine

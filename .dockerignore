@@ -2,6 +2,7 @@
 # source path, which makes the in-container `cmake -S . -B build` fail with a cache/source mismatch.
 # It's also large (hundreds of MB), so excluding it keeps the build context small and fast.
 build/
+build-*/
 cmake-build-*/
 out/
 

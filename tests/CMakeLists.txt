@@ -2,6 +2,12 @@ add_executable(unit_tests test_main.cpp test_core.cpp test_schema.cpp test_api.c
 target_link_libraries(unit_tests PRIVATE cynamodb_core Catch2::Catch2WithMain)
 add_test(NAME unit_tests COMMAND unit_tests)
 
+add_executable(memory_regression_tests test_memory_regression.cpp)
+target_link_libraries(memory_regression_tests PRIVATE cynamodb_core)
+target_compile_options(memory_regression_tests PRIVATE ${CYNAMODB_WARNING_FLAGS})
+add_test(NAME memory_regression_tests COMMAND memory_regression_tests)
+set_tests_properties(memory_regression_tests PROPERTIES TIMEOUT 180 LABELS "memory;stress")
+
 # Live end-to-end CRUD + persistence test: starts the real server binary over
 # HTTP, exercises Create/Read/Update/Delete across multiple process restarts, and
 # validates data survives correctly. Registered only when python3 is available.

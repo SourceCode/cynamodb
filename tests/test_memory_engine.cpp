@@ -180,6 +180,30 @@ TEST_CASE("MemoryEngine scan pagination visits every item exactly once", "[engin
     REQUIRE(collected == expected);
 }
 
+TEST_CASE("MemoryEngine read pages are bounded by data size", "[engine][memory][pagination][memory]") {
+    MemoryEngine engine;
+    const std::string table = "LargePage";
+    const std::string payload(300 * 1024, 'x');
+    for (int i = 0; i < 4; ++i) {
+        const std::string key = "k" + std::to_string(i);
+        engine.put(table, key, item_with("pk", key, "payload", payload));
+    }
+
+    auto first_scan = engine.scan(table, std::nullopt, 0);
+    REQUIRE(first_scan.items.size() == 3);
+    REQUIRE(first_scan.last_evaluated_key.has_value());
+    auto final_scan = engine.scan(table, first_scan.last_evaluated_key, 0);
+    REQUIRE(final_scan.items.size() == 1);
+    REQUIRE_FALSE(final_scan.last_evaluated_key.has_value());
+
+    auto first_query = engine.query(table, {}, std::nullopt, 0);
+    REQUIRE(first_query.items.size() == 3);
+    REQUIRE(first_query.last_evaluated_key.has_value());
+    auto final_query = engine.query(table, {}, first_query.last_evaluated_key, 0);
+    REQUIRE(final_query.items.size() == 1);
+    REQUIRE_FALSE(final_query.last_evaluated_key.has_value());
+}
+
 TEST_CASE("MemoryEngine query filters by equality conditions", "[engine][memory][query]") {
     MemoryEngine engine;
     const std::string table = "Q";
